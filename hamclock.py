@@ -1,4 +1,3 @@
-
 import curses
 import os
 import io
@@ -31,7 +30,7 @@ class AppConfig:
     wx_location_name: str = ""
     wx_lat: Optional[float] = None
     wx_lon: Optional[float] = None
-    wx_grid: str = ""  # Maidenhead grid square (e.g., "DM79nu"); used if lat/lon not set
+    wx_grid: str = ""  # Maidenhead grid square (e.g., "DO42nu"); used if lat/lon not set
     wx_update_seconds: float = 1800.0  # 30 minutes (Open-Meteo poll interval)
     tz_label: str = "America/Denver"
 
@@ -597,14 +596,24 @@ def wmo_weather_code_to_text(code: Optional[int]) -> str:
     return mapping.get(code, f"Code {code}" if code is not None else "N/A")
 
 
-def degrees_to_compass_16(deg: float) -> str:
-    """Convert degrees (meteorological) to nearest 16-wind compass point (N, NNE, ...).
-    Accepts any numeric value; normalizes to [0, 360).
+def wind_deg_to_compass(deg: Optional[float]) -> str:
+    """Convert meteorological wind direction in degrees to nearest 16-point compass direction.
+
+    Open-Meteo returns wind_direction_10m as degrees (0..360) where 0/360 = North, 90 = East.
     """
-    deg = float(deg) % 360.0
-    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
-    idx = int((deg + 11.25) // 22.5) % 16
+    if deg is None:
+        return "N/A"
+    try:
+        d = float(deg) % 360.0
+    except Exception:
+        return "N/A"
+
+    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    idx = int((d + 11.25) // 22.5) % 16
     return dirs[idx]
+
+
 
 
 def update_weather_open_meteo(cfg: AppConfig, state: AppState):
@@ -637,7 +646,7 @@ def update_weather_open_meteo(cfg: AppConfig, state: AppState):
         state.wx_static_lines = [
             loc,
             f"Temp:  {temp:.1f}°C (feels {app:.1f}°C)  RH {rh:.0f}%" if temp is not None and app is not None and rh is not None else "Temp:  N/A",
-            f"Wind:  {ws:.0f} km/h @ {wd:.0f}° {degrees_to_compass_16(wd)}  Gust {gust:.0f}" if ws is not None and wd is not None and gust is not None else "Wind:  N/A",
+            f"Wind:  {ws:.0f} km/h @ {wd:.0f}° ({wind_deg_to_compass(wd)})  Gust {gust:.0f}" if ws is not None and wd is not None and gust is not None else "Wind:  N/A",
             f"Sky:   {sky}",
         ]
     except Exception as e:
@@ -671,37 +680,63 @@ def strip_dx_prefix(line: str) -> str:
 
 def format_dx_spot(line: str) -> str:
     """
-    Parse common DX cluster spot lines and reformat to:
-        <spotter> <freq> <spotted> <HHMM>Z <grid>
+    Parse common DX cluster spot lines and reformat to fixed-width columns:
+        <spotter> <freq> <spotted> <HHMM>Z [<grid>]
 
-    Example input:
-        DX de F1SNB: 14090.0 XX9W FT8 JN33dh -> OL62 1750Z JN33
-    Output:
-        F1SNB 14090.0 XX9W 1750Z JN33
-
-    If a line does not match expected format, returns the line with "DX de" removed.
+    - Removes leading 'DX de'.
+    - Spotter and spotted callsign columns are max width 8 (left-justified).
+    - Time is always 5 characters (HHMMZ).
+    - Grid is 4 characters: two uppercase letters A-R then two digits (e.g., JN19).
+    - Grid may appear immediately before or after time, or elsewhere near the end.
     """
     clean = strip_dx_prefix(line).strip()
 
-    # Expect: "<spotter>: <rest>"
+    # Expect: '<spotter>: <rest>'
     m = re.match(r'^(\S+):\s*(.+)$', clean)
     if not m:
         return clean
 
     spotter = m.group(1)
     rest = m.group(2).strip()
-
-    # Heuristic parse for common "sh/dx" format: freq, spotted call, (optional comment...), HHMMZ, grid
-    m2 = re.match(r'^(\d+(?:\.\d+)?)\s+(\S+)(?:\s+(.*?))?\s+(\d{4})Z\s+(\S+)', rest)
-    if not m2:
+    parts = rest.split()
+    if len(parts) < 2:
         return clean
 
-    freq = m2.group(1)
-    spotted = m2.group(2)
-    hhmm = m2.group(4)
-    grid = m2.group(5)
+    freq = parts[0]
+    spotted = parts[1]
 
-    return f"{spotter} {freq} {spotted} {hhmm}Z {grid}"
+    # Find last HHMMZ token (time).
+    time_tok = None
+    time_idx = None
+    for idx in range(len(parts) - 1, -1, -1):
+        if re.fullmatch(r'\d{4}Z', parts[idx]):
+            time_tok = parts[idx]
+            time_idx = idx
+            break
+
+    # Grid: prefer adjacent to time (after, then before); else last grid-like token anywhere.
+    grid = None
+    if time_idx is not None:
+        if time_idx + 1 < len(parts) and re.fullmatch(r'[A-R]{2}\d{2}', parts[time_idx + 1]):
+            grid = parts[time_idx + 1]
+        elif time_idx - 1 >= 0 and re.fullmatch(r'[A-R]{2}\d{2}', parts[time_idx - 1]):
+            grid = parts[time_idx - 1]
+
+    if grid is None:
+        for tok in reversed(parts):
+            if re.fullmatch(r'[A-R]{2}\d{2}', tok):
+                grid = tok
+                break
+
+    # Fixed-width columns: callsigns max 8 chars; time fixed 5 chars; grid fixed 4 chars.
+    spotter_col = f"{spotter:<8.8}"
+    freq_col = f"{freq:>8}"
+    spotted_col = f"{spotted:<8.8}"
+    time_col = time_tok if time_tok else "????Z"
+
+    if grid:
+        return f"{spotter_col} {freq_col} {spotted_col} {time_col} {grid}"
+    return f"{spotter_col} {freq_col} {spotted_col} {time_col}"
 
 def dx_cluster_worker(cfg: AppConfig, state: AppState):
     while state.running:
@@ -728,9 +763,8 @@ def dx_cluster_worker(cfg: AppConfig, state: AppState):
                 time.sleep(0.3)
 
                 # Requested: show DX spots
-                s.sendall(b"sh/dx\n")
 
-                state.status_line = "DX cluster connected. Command sent: sh/dx"
+                state.status_line = "DX cluster connected."
                 state.dirty_status = True
 
                 linebuf = b""
