@@ -15,4 +15,16 @@ time_refresh_seconds: Default is one second so it makes the clock tick
 
 Pressing ESC will bring up a menu with "Settings" and "Quit".  Only Quit works at the moment.  I will have to vibe code in the settings at some point.  You can also just press "q" while it's running to quit.
 
-Have fun with it.4
+Have fun with it.
+
+April 2/2025 changes
+
+Remember this thing is 99% vibe coded using ChatGPT.  While I can program python, it's not my strongest language.  I've been using this to help me see how python works along with ncurses.  I'll be uploading a sample hamlib.sqlite database that has about 100 rows in it.
+
+- Added the ability to look up callsigns from hamdb.org, hamqth.com (with login) and qrz.com (with login & membership).  This will update the hamcall.sqlite if it's not already in there.
+- Added a menu item to select which online lookup to use with user name and password.
+- Added menu item to do a one off lookup.  It checks the hamcall.sqlite database first then will check online (and update database if needed).
+- Shrunk the world map panel and used the left side to show the DE and DX info that is coming in through the DX Cluster.  The DE/DX will show what database it found the callsign data in.
+- Added status bar for online lookups.  Needed this for debugging mostly.
+- Added some debug logging.  This can be turned on or off in the settings menu.  Leaving it on will create a huge text file as it dumps a lot of info.
+- Removed the markers for DE/DX on the world map.  I'm not sure how I want to implement this as it could get very cluttered and it doesn't always render the X and Y characters properly.
