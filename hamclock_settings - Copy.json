@@ -1,0 +1,21 @@
+{
+  "dx_filter": "clear/spots all",
+  "dx_host": "",
+  "dx_pass": "",
+  "dx_port": 7300,
+  "dx_user": "",
+  "enable_logging": false,
+  "map_image_path": "world_map.jpg",
+  "map_refresh_seconds": 300.0,
+  "online_lookup_password": "password",
+  "online_lookup_username": "username",
+  "online_lookup_website": "qrz.com",
+  "refresh_seconds": 10.0,
+  "time_refresh_seconds": 1.0,
+  "tz_label": "America/Denver",
+  "wx_grid": "EO42nu",
+  "wx_lat": null,
+  "wx_location_name": "Where are you?",
+  "wx_lon": null,
+  "wx_update_seconds": 1800.0
+}
