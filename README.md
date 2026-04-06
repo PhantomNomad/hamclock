@@ -28,3 +28,10 @@ Remember this thing is 99% vibe coded using ChatGPT.  While I can program python
 - Added status bar for online lookups.  Needed this for debugging mostly.
 - Added some debug logging.  This can be turned on or off in the settings menu.  Leaving it on will create a huge text file as it dumps a lot of info.
 - Removed the markers for DE/DX on the world map.  I'm not sure how I want to implement this as it could get very cluttered and it doesn't always render the X and Y characters properly.
+
+April 5/2026 changes
+- Added simple log book.  It will create the tables if missing from mysql or sqlite.  Pretty simple.  When you type in the call sign it will grab their information from the tables/qrz/hamdb/hamlib as needed.  If the call sign is missing from the local lookup table it will insert it from the online one.  Pressing "L" will replace the world map with the log book.  It shows the last 10 logged contacts.
+- Added radio control.  This uses Rigctld only at this time, so you will need to have that working first.  It gets info from the radio and displays it.  It will also populate the frequency in the log book and mode (USB, LSB, CW, RTTY)
+- When world map is showing you can use the arrow keys to go up and down the DX cluster and when you hit Enter it will change the radio to that frequency and mode.  It defaults band width to 3000khz for SSB, 1200khz for CW.
+- Added F1 help that shows what all the keys do.
+- Remember this is 99.99% vibe coded so if things don't make sense in the code it's not my fault :)
