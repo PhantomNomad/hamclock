@@ -35,3 +35,11 @@ April 5/2026 changes
 - When world map is showing you can use the arrow keys to go up and down the DX cluster and when you hit Enter it will change the radio to that frequency and mode.  It defaults band width to 3000khz for SSB, 1200khz for CW.
 - Added F1 help that shows what all the keys do.
 - Remember this is 99.99% vibe coded so if things don't make sense in the code it's not my fault :)
+
+April 6/2025 changes
+- Added shortwave.  When at the main screen if you hit "S" it changes the world map to the shortwave database.  You will need to download the latest csv file from http://www.eibispace.de/.  You can filter the list by language in the json file.  See the README.txt file at the same website to see the abbrviations for languages.  You can set the highlight colour for the target location to make it easier to find stations broadcasting to your location.  Since the csv file has a lot more then just shortwave you can toggle on/off to show only those in the shortwave bands.
+  "shortwave_languages": "E",
+  "shortwave_highlight_target": "North America",
+  "shortwave_highlight_color": "cyan",
+  "shortwave_broadcast_bands_only": true
+- You will also need the two new .json files that convert languages and locations.
