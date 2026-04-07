@@ -4,7 +4,7 @@
   "dx_cluster_password": "",
   "dx_cluster_port": 7300,
   "dx_cluster_username": "",
-  "dx_filter": "",
+  "dx_filter": "accept/spot 6 by w,k,n,wh,kh,nh",
   "dx_host": "",
   "dx_pass": "",
   "dx_port": 7300,
@@ -25,7 +25,7 @@
   "mysql_username": "",
   "online_lookup_password": "",
   "online_lookup_username": "",
-  "online_lookup_website": "qrz.com",
+  "online_lookup_website": "",
   "refresh_seconds": 1800.0,
   "rig_control_enabled": true,
   "rigctld_host": "",
@@ -34,7 +34,10 @@
   "space_weather_refresh_sec": 1800.0,
   "sqlite_file_name": "hamcall.sqlite",
   "time_refresh_seconds": 1.0,
-  "time_zone": "",
+  "time_zone": "America/Denver",
   "world_map_refresh_sec": 300.0,
-  "wx_location_name": ""
+  "shortwave_languages": "E",
+  "shortwave_highlight_target": "North America",
+  "shortwave_highlight_color": "cyan",
+  "shortwave_broadcast_bands_only": true
 }
