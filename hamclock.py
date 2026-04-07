@@ -1,3 +1,4 @@
+
 import curses
 
 
@@ -165,6 +166,7 @@ class AppConfig:
     rigctld_port: int = 4532
     rigctld_poll_ms: int = 1000
     shortwave_schedule_file: str = "sked-a26.csv"
+    shortwave_languages: str = ""
     shortwave_highlight_target: str = "North America"
     shortwave_highlight_color: str = "cyan"
     shortwave_broadcast_bands_only: bool = True
@@ -240,7 +242,7 @@ class AppState:
     shortwave_selected_idx: int = 0
     shortwave_last_refresh_key: str = ""
     cfg: Optional[AppConfig] = None
-    shortwave_languages: str = "E,F,S"
+    shortwave_languages: str = ""
 
 
 
@@ -1937,8 +1939,85 @@ def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
                             setattr(cfg, key, str(answer).strip())
                     except Exception:
                         pass
+
+
+def edit_shortwave_dialog(stdscr, cfg: AppConfig, state: AppState):
+    fields = [
+        ("Schedule File", "shortwave_schedule_file"),
+        ("Languages", "shortwave_languages"),
+        ("Highlight Target", "shortwave_highlight_target"),
+        ("Highlight Color", "shortwave_highlight_color"),
+        ("Broadcast Bands Only", "shortwave_broadcast_bands_only"),
+    ]
+
+    normalize_config(cfg)
+    values = {}
+    for _, attr in fields:
+        v = getattr(cfg, attr, "")
+        values[attr] = "" if v is None else str(v)
+
+    idx = 0
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+
+    while True:
+        maxy, maxx = stdscr.getmaxyx()
+        w = min(80, max(44, maxx - 4))
+        h = len(fields) + 6
+        y0 = max(1, (maxy - h) // 2)
+        x0 = max(0, (maxx - w) // 2)
+
+        win = curses.newwin(h, w, y0, x0)
+        win.keypad(True)
+        win.erase()
+        win.box()
+        title = " Shortwave (Enter=edit, F2=Save, ESC=Cancel) "
+        safe_addstr(win, 0, max(2, (w - len(title)) // 2), title, curses.A_BOLD)
+
+        for row, (label, attr) in enumerate(fields):
+            style = curses.A_REVERSE if row == idx else curses.A_NORMAL
+            val = values.get(attr, "")
+            safe_addstr(win, row + 2, 2, f"{label}:"[: w - 4], style)
+            safe_addstr(win, row + 2, 28, val[: max(1, w - 30)], style)
+
+        safe_addstr(win, h - 2, 2, "Enter edits. F2 saves and applies. ESC cancels.", curses.A_DIM)
+        win.refresh()
+        k = win.getch()
+
+        if k in (27,):
+            curses.curs_set(0)
+            stdscr.timeout(100)
+            return
+        elif k == curses.KEY_UP:
+            idx = max(0, idx - 1)
+        elif k == curses.KEY_DOWN:
+            idx = min(len(fields) - 1, idx + 1)
+        elif k == curses.KEY_F2:
+            try:
+                cfg.shortwave_schedule_file = values.get("shortwave_schedule_file", "").strip() or "sked-a26.csv"
+                cfg.shortwave_languages = values.get("shortwave_languages", "").strip() or "E,F,S"
+                cfg.shortwave_highlight_target = values.get("shortwave_highlight_target", "").strip() or "North America"
+                cfg.shortwave_highlight_color = values.get("shortwave_highlight_color", "").strip() or "cyan"
+                cfg.shortwave_broadcast_bands_only = _coerce_bool(values.get("shortwave_broadcast_bands_only", "true"), True)
+                save_config(cfg)
+                apply_config_runtime(cfg, state)
+                refresh_shortwave_view(cfg, state)
+                state.status_line = "Shortwave settings saved and applied"
+            except Exception as e:
+                state.status_line = f"Shortwave settings save failed: {e}"
+            state.dirty_status = True
+            curses.curs_set(0)
+            stdscr.timeout(100)
+            return
+        elif k in (curses.KEY_ENTER, 10, 13):
+            label, attr = fields[idx]
+            s = _input_box(stdscr, y0 + h - 3, x0, w, f"{label}: ", values.get(attr, ""))
+            if s is not None:
+                values[attr] = s
+
+
 def file_menu_dialog(stdscr, cfg: AppConfig, state: AppState):
-    items = ["Settings", "Rig Control", "DX Cluster", "Local Database", "Online lookup", "Look up call sign", "Quit"]
+    items = ["Settings", "Rig Control", "DX Cluster", "Local Database", "Shortwave", "Online lookup", "Look up call sign", "Quit"]
     idx = 0
     curses.curs_set(0)
     stdscr.nodelay(False)
@@ -1999,6 +2078,8 @@ def file_menu_dialog(stdscr, cfg: AppConfig, state: AppState):
                 edit_dx_cluster_dialog(stdscr, cfg, state)
             elif choice == "Local Database":
                 edit_local_database_dialog(stdscr, cfg, state)
+            elif choice == "Shortwave":
+                edit_shortwave_dialog(stdscr, cfg, state)
             elif choice == "Online lookup":
                 edit_online_lookup_dialog(stdscr, cfg, state)
             elif choice == "Look up call sign":
@@ -2199,10 +2280,6 @@ def edit_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
         ("Grid Square", "grid_square"),
         ("Local Weather Refresh (sec)", "local_weather_refresh_sec"),
         ("Time Zone", "time_zone"),
-        ("Shortwave Languages", "shortwave_languages"),
-        ("Shortwave Highlight Target", "shortwave_highlight_target"),
-        ("Shortwave Highlight Color", "shortwave_highlight_color"),
-        ("Shortwave Broadcast Bands Only", "shortwave_broadcast_bands_only"),
     ]
 
     normalize_config(cfg)
@@ -6951,7 +7028,7 @@ def main(stdscr):
             poll_rigctld_once(cfg, state)
             last_rig_refresh = now
 
-        if (now - last_shortwave_refresh) >= 60.0:
+        if state.shortwave_mode and (now - last_shortwave_refresh) >= 900.0:
             refresh_shortwave_view(cfg, state)
             last_shortwave_refresh = now
 
@@ -7260,4 +7337,3 @@ def edit_simple_fields_dialog(stdscr, title: str, cfg: AppConfig, fields: List[d
                     setattr(cfg, fld["attr"], raw.strip())
         elif ch in (ord('s'), ord('S')):
             break
-
