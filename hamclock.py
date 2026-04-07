@@ -1,4 +1,3 @@
-
 import curses
 
 
@@ -41,6 +40,7 @@ import ssl
 import re
 import json
 import sqlite3
+import glob
 
 try:
     import pymysql as _mysql_driver
@@ -164,6 +164,10 @@ class AppConfig:
     rigctld_host: str = "127.0.0.1"
     rigctld_port: int = 4532
     rigctld_poll_ms: int = 1000
+    shortwave_schedule_file: str = "sked-a26.csv"
+    shortwave_highlight_target: str = "North America"
+    shortwave_highlight_color: str = "cyan"
+    shortwave_broadcast_bands_only: bool = True
 
 
 @dataclass
@@ -231,12 +235,38 @@ class AppState:
     rig_nr: bool = False
     rig_status_line: str = "Radio: disabled"
     dirty_rig: bool = True
+    shortwave_mode: bool = False
+    shortwave_rows: List[dict] = field(default_factory=list)
+    shortwave_selected_idx: int = 0
+    shortwave_last_refresh_key: str = ""
+    cfg: Optional[AppConfig] = None
+    shortwave_languages: str = "E,F,S"
 
 
 
 
 # ---- config persistence ----
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hamclock_settings.json")
+
+SHORTWAVE_TARGET_CODE_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortwave_target_code_map.json")
+SHORTWAVE_TX_SITE_CODE_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortwave_tx_site_code_map.json")
+
+def _load_json_lookup_file(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _load_shortwave_lookup_maps() -> tuple:
+    return (
+        _load_json_lookup_file(SHORTWAVE_TARGET_CODE_MAP_FILE),
+        _load_json_lookup_file(SHORTWAVE_TX_SITE_CODE_MAP_FILE),
+    )
+
+SHORTWAVE_TARGET_CODE_MAP, SHORTWAVE_TX_SITE_CODE_MAP = _load_shortwave_lookup_maps()
+
 
 def load_config(path: str = CONFIG_FILE) -> AppConfig:
     """Load persisted configuration from JSON.
@@ -288,6 +318,19 @@ def save_config(cfg: AppConfig, path: str = CONFIG_FILE) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off", ""):
+        return False
+    return default
+
 def normalize_config(cfg: AppConfig) -> AppConfig:
     """Normalize menu-facing settings into the runtime fields still used elsewhere."""
     try:
@@ -336,6 +379,15 @@ def normalize_config(cfg: AppConfig) -> AppConfig:
 
     if not getattr(cfg, "online_lookup_website", ""):
         cfg.online_lookup_website = "hamdb.org"
+
+    if not getattr(cfg, "shortwave_highlight_target", ""):
+        cfg.shortwave_highlight_target = "North America"
+    if not getattr(cfg, "shortwave_highlight_color", ""):
+        cfg.shortwave_highlight_color = "cyan"
+    try:
+        cfg.shortwave_broadcast_bands_only = _coerce_bool(getattr(cfg, "shortwave_broadcast_bands_only", True), True)
+    except Exception:
+        cfg.shortwave_broadcast_bands_only = True
 
     return cfg
 
@@ -657,7 +709,12 @@ def refresh_logbook_lines(cfg: AppConfig, state: AppState) -> None:
         state.logbook_recent_rows = []
         state.logbook_selected_idx = 0
         state.logbook_lines = [
-            "Logbook mode",
+            "Shortwave panel",
+        "  Up/Down = Select station on air now",
+        "  Enter = Tune selected station in its listed mode",
+        "  S = Return to map/logbook view",
+        "",
+        "Logbook mode",
             "",
             "No station callsign selected.",
             "Press C to add/select a station callsign.",
@@ -1053,6 +1110,7 @@ def _freq_to_band_name(freq_khz) -> str:
         (3500.0, 4000.0, "80m"),
         (5330.0, 5406.5, "60m"),
         (7000.0, 7300.0, "40m"),
+        (10000.0, 10001.0, "WWV3"),
         (10100.0, 10150.0, "30m"),
         (14000.0, 14350.0, "20m"),
         (18068.0, 18168.0, "17m"),
@@ -1656,6 +1714,7 @@ def delete_selected_qso_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
 
 def apply_config_runtime(cfg: AppConfig, state: AppState) -> None:
     normalize_config(cfg)
+    state.cfg = cfg
     try:
         initialize_online_lookup_session(cfg, state)
     except Exception:
@@ -2140,6 +2199,10 @@ def edit_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
         ("Grid Square", "grid_square"),
         ("Local Weather Refresh (sec)", "local_weather_refresh_sec"),
         ("Time Zone", "time_zone"),
+        ("Shortwave Languages", "shortwave_languages"),
+        ("Shortwave Highlight Target", "shortwave_highlight_target"),
+        ("Shortwave Highlight Color", "shortwave_highlight_color"),
+        ("Shortwave Broadcast Bands Only", "shortwave_broadcast_bands_only"),
     ]
 
     normalize_config(cfg)
@@ -2197,6 +2260,10 @@ def edit_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
                 cfg.grid_square = values.get("grid_square", "").strip()
                 cfg.local_weather_refresh_sec = float(values.get("local_weather_refresh_sec", "1800") or "1800")
                 cfg.time_zone = values.get("time_zone", "").strip() or "America/Edmonton"
+                cfg.shortwave_languages = values.get("shortwave_languages", "").strip() or "E"
+                cfg.shortwave_highlight_target = values.get("shortwave_highlight_target", "").strip() or "North America"
+                cfg.shortwave_highlight_color = values.get("shortwave_highlight_color", "").strip() or "cyan"
+                cfg.shortwave_broadcast_bands_only = _coerce_bool(values.get("shortwave_broadcast_bands_only", "true"), True)
                 save_config(cfg)
                 apply_config_runtime(cfg, state)
                 state.status_line = "Settings saved and applied"
@@ -5255,6 +5322,746 @@ def _simple_message_popup(stdscr, title: str, message: str):
         pass
 
 
+
+def _find_shortwave_schedule_path(cfg: AppConfig) -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    configured = str(getattr(cfg, "shortwave_schedule_file", "sked-a26.csv") or "sked-a26.csv").strip()
+    candidates = []
+    if configured:
+        if os.path.isabs(configured):
+            candidates.append(configured)
+        else:
+            candidates.append(os.path.join(base_dir, configured))
+            candidates.append(os.path.join(os.getcwd(), configured))
+    candidates.extend(sorted(glob.glob(os.path.join(base_dir, "*sked-a26.csv"))))
+    candidates.extend(sorted(glob.glob(os.path.join(os.getcwd(), "*sked-a26.csv"))))
+    seen = set()
+    for candidate in candidates:
+        norm = os.path.abspath(candidate)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.exists(norm) and os.path.isfile(norm):
+            return norm
+    return ""
+
+def _get_shortwave_language_filter(cfg: AppConfig) -> list:
+    raw = str(getattr(cfg, "shortwave_languages", "E") or "E").strip().upper()
+    if not raw:
+        raw = "E"
+    vals = []
+    for part in re.split(r"[,;|\s]+", raw):
+        part = part.strip().upper()
+        if part:
+            vals.append(part)
+    return vals or ["E"]
+
+def _shortwave_extract_lang_codes(lang_value: str) -> set:
+    s = str(lang_value or "").upper().strip()
+    if not s:
+        return set()
+    codes = set()
+    for tok in re.findall(r"[A-Z]+", s):
+        tok = tok.strip().upper()
+        if not tok:
+            continue
+        if len(tok) <= 4 and tok.isalpha():
+            for ch in tok:
+                codes.add(ch)
+        else:
+            codes.add(tok)
+    return codes
+
+def _shortwave_lang_matches(lang_value: str, allowed_langs) -> bool:
+    allowed = {str(x).strip().upper() for x in (allowed_langs or []) if str(x).strip()}
+    if not allowed:
+        return True
+    row_codes = _shortwave_extract_lang_codes(lang_value)
+    return bool(row_codes & allowed)
+
+def _shortwave_clean_csv_field(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\[[^\]]*\]", "", s).strip()
+    return s
+
+def shorten_desc(s, limit=30):
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    s = re.sub(r"\([^)]*\)", "", s).strip()
+    if len(s) <= limit:
+        return s
+    cut = s[:limit].rstrip()
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut + "…"
+
+_SHORTWAVE_TARGET_ASSUMPTIONS = {
+    "WEu": "Western Europe",
+    "CEu": "Central Europe",
+    "EEu": "Eastern Europe",
+    "NEu": "Northern Europe",
+    "SEu": "Southern Europe",
+    "Eu": "Europe",
+    "NAm": "North America",
+    "CAm": "Central America",
+    "SAm": "South America",
+    "Car": "Caribbean",
+    "Af": "Africa",
+    "NAf": "North Africa",
+    "WAf": "West Africa",
+    "EAf": "East Africa",
+    "SAf": "Southern Africa",
+    "ME": "Middle East",
+    "Gulf": "Gulf States",
+    "CAs": "Central Asia",
+    "EAs": "East Asia",
+    "SEAs": "Southeast Asia",
+    "SAs": "South Asia",
+    "Oc": "Oceania",
+    "Pac": "Pacific",
+    "ANZ": "Australia / New Zealand",
+    "AUS": "Alice Springs",
+}
+
+def _shortwave_title_case_words(text: str) -> str:
+    parts = []
+    for word in str(text or "").split():
+        if word.isupper() and len(word) <= 4:
+            parts.append(word)
+        else:
+            parts.append(word[:1].upper() + word[1:] if word else word)
+    return " ".join(parts)
+
+def _shortwave_clean_target_desc(desc: str) -> str:
+    s = re.sub(r"\s+", " ", str(desc or "")).strip(" -,:;")
+    if not s:
+        return ""
+    s = re.sub(r"^[A-Z0-9]{1,5}\s*=\s*", "", s)
+    s = re.sub(r"^[a-z]\s*-\s*", "", s)
+    s = s.strip(" -,:;")
+    return _shortwave_title_case_words(s)
+
+def _shortwave_target_label(code: str) -> str:
+    code = _shortwave_clean_csv_field(code)
+    if not code:
+        return ""
+    desc = SHORTWAVE_TARGET_CODE_MAP.get(code, "")
+    if desc:
+        cleaned = _shortwave_clean_target_desc(desc)
+        if cleaned:
+            return shorten_desc(cleaned, 24)
+    assumed = _SHORTWAVE_TARGET_ASSUMPTIONS.get(code, "")
+    if assumed:
+        return assumed
+    return code
+
+
+_SHORTWAVE_HIGHLIGHT_COLOR_MAP = {
+    "black": curses.COLOR_BLACK,
+    "red": curses.COLOR_RED,
+    "green": curses.COLOR_GREEN,
+    "yellow": curses.COLOR_YELLOW,
+    "blue": curses.COLOR_BLUE,
+    "magenta": curses.COLOR_MAGENTA,
+    "cyan": curses.COLOR_CYAN,
+    "white": curses.COLOR_WHITE,
+}
+
+_SHORTWAVE_HIGHLIGHT_PAIR_MAP = {
+    "black": 22,
+    "red": 23,
+    "green": 24,
+    "yellow": 25,
+    "blue": 26,
+    "magenta": 27,
+    "cyan": 28,
+    "white": 29,
+}
+
+_SHORTWAVE_BROADCAST_BANDS_KHZ = [
+    (2300.0, 2495.0),
+    (3200.0, 3400.0),
+    (3900.0, 4000.0),
+    (4750.0, 5060.0),
+    (5900.0, 6200.0),
+    (7300.0, 7600.0),
+    (9400.0, 9900.0),
+    (11600.0, 12100.0),
+    (13570.0, 13870.0),
+    (15100.0, 15830.0),
+    (17480.0, 17900.0),
+    (18900.0, 19020.0),
+    (21450.0, 21850.0),
+    (25670.0, 26100.0),
+]
+
+
+
+_BUILTIN_TIME_SIGNAL_ROWS = [
+    {"frequency_khz": 2500.0, "station": "WWV Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Fort Collins, CO", "remarks": "Fort Collins, CO", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 5000.0, "station": "WWV Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Fort Collins, CO", "remarks": "Fort Collins, CO", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 10000.0, "station": "WWV Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Fort Collins, CO", "remarks": "Fort Collins, CO", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 15000.0, "station": "WWV Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Fort Collins, CO", "remarks": "Fort Collins, CO", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 20000.0, "station": "WWV Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Fort Collins, CO", "remarks": "Fort Collins, CO", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 25000.0, "station": "WWV Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Fort Collins, CO", "remarks": "Fort Collins, CO", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": "Experimental 25 MHz"},
+    {"frequency_khz": 2500.0, "station": "WWVH Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Kauai, HI", "remarks": "Kauai, HI", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 5000.0, "station": "WWVH Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Kauai, HI", "remarks": "Kauai, HI", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 10000.0, "station": "WWVH Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Kauai, HI", "remarks": "Kauai, HI", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 15000.0, "station": "WWVH Time Signal", "itu": "USA", "target": "North America", "lang": "TS", "tx_display": "Kauai, HI", "remarks": "Kauai, HI", "persistence": "24h", "mode": "AM", "category": "time_signal", "note": ""},
+    {"frequency_khz": 3330.0, "station": "CHU Time Signal", "itu": "CAN", "target": "Canada / North America", "lang": "TS", "tx_display": "Ottawa, ON", "remarks": "Ottawa, ON", "persistence": "24h", "mode": "USB", "category": "time_signal", "note": "AM-compatible USB"},
+    {"frequency_khz": 7850.0, "station": "CHU Time Signal", "itu": "CAN", "target": "Canada / North America", "lang": "TS", "tx_display": "Ottawa, ON", "remarks": "Ottawa, ON", "persistence": "24h", "mode": "USB", "category": "time_signal", "note": "AM-compatible USB"},
+    {"frequency_khz": 14670.0, "station": "CHU Time Signal", "itu": "CAN", "target": "Canada / North America", "lang": "TS", "tx_display": "Ottawa, ON", "remarks": "Ottawa, ON", "persistence": "24h", "mode": "USB", "category": "time_signal", "note": "AM-compatible USB"},
+]
+
+
+_BUILTIN_WESTERN_CANADA_AM_ROWS = [
+    # Alberta
+    {"frequency_khz": 540.0, "station": "CBK Regina relay", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Lloydminster, AB", "remarks": "Lloydminster, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 580.0, "station": "CHAH", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Edmonton, AB", "remarks": "Edmonton, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 660.0, "station": "CFFR", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Calgary, AB", "remarks": "Calgary, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 700.0, "station": "CJLI", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Calgary, AB", "remarks": "Calgary, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 740.0, "station": "CBX", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Edmonton, AB", "remarks": "Edmonton, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 770.0, "station": "CHQR", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Calgary, AB", "remarks": "Calgary, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 880.0, "station": "CHED", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Edmonton, AB", "remarks": "Edmonton, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 930.0, "station": "CJCA", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Edmonton, AB", "remarks": "Edmonton, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 960.0, "station": "CFAC", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Calgary, AB", "remarks": "Calgary, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1010.0, "station": "CBR", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Calgary, AB", "remarks": "Calgary, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1140.0, "station": "CHRB", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Calgary, AB", "remarks": "Calgary, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1440.0, "station": "CKJR", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Wetaskiwin, AB", "remarks": "Wetaskiwin, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1540.0, "station": "CBXD", "itu": "CAN", "target": "Alberta", "lang": "AM", "tx_display": "Edson, AB", "remarks": "Edson, AB", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+
+    # British Columbia
+    {"frequency_khz": 570.0, "station": "CKWL", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Williams Lake, BC", "remarks": "Williams Lake, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 590.0, "station": "CFTK", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Terrace, BC", "remarks": "Terrace, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 600.0, "station": "CKSP", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Vancouver, BC", "remarks": "Vancouver, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 610.0, "station": "CHNL", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Kamloops, BC", "remarks": "Kamloops, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 650.0, "station": "CISL", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Vancouver, BC", "remarks": "Vancouver, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 690.0, "station": "CBU", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Vancouver, BC", "remarks": "Vancouver, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 730.0, "station": "CKNW", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Vancouver, BC", "remarks": "Vancouver, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 800.0, "station": "CKOR", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Penticton, BC", "remarks": "Penticton, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 840.0, "station": "CKBX", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "100 Mile House, BC", "remarks": "100 Mile House, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 860.0, "station": "CFPR", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Prince Rupert, BC", "remarks": "Prince Rupert, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 860.0, "station": "CBUP", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Merritt, BC", "remarks": "Merritt, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 870.0, "station": "CFBV", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Burns Lake, BC", "remarks": "Burns Lake, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 870.0, "station": "CKIR", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Invermere, BC", "remarks": "Invermere, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 890.0, "station": "CJDC", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Dawson Creek, BC", "remarks": "Dawson Creek, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1070.0, "station": "CFAX", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Victoria, BC", "remarks": "Victoria, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1130.0, "station": "CKWX", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Vancouver, BC", "remarks": "Vancouver, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1150.0, "station": "CKFR", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Kelowna, BC", "remarks": "Kelowna, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1200.0, "station": "CJRJ", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Vancouver, BC", "remarks": "Vancouver, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1230.0, "station": "CJNL", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Merritt, BC", "remarks": "Merritt, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1240.0, "station": "CFNI", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Port Hardy, BC", "remarks": "Port Hardy, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1240.0, "station": "CJOR", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Osoyoos, BC", "remarks": "Osoyoos, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1260.0, "station": "CBPU", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Ucluelet, BC", "remarks": "Ucluelet, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1260.0, "station": "CBPM", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Sicamous, BC", "remarks": "Sicamous, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1320.0, "station": "CHMB", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Vancouver, BC", "remarks": "Vancouver, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1340.0, "station": "CINL", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Ashcroft, BC", "remarks": "Ashcroft, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1580.0, "station": "CBPK", "itu": "CAN", "target": "British Columbia", "lang": "AM", "tx_display": "Revelstoke, BC", "remarks": "Revelstoke, BC", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+
+    # Saskatchewan
+    {"frequency_khz": 540.0, "station": "CBK", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Regina, SK", "remarks": "Regina, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 570.0, "station": "CKSW", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Swift Current, SK", "remarks": "Swift Current, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 600.0, "station": "CJWW", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Saskatoon, SK", "remarks": "Saskatoon, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 620.0, "station": "CKRM", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Regina, SK", "remarks": "Regina, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 650.0, "station": "CKOM", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Saskatoon, SK", "remarks": "Saskatoon, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 800.0, "station": "CHAB", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Moose Jaw, SK", "remarks": "Moose Jaw, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 860.0, "station": "CBKF-2", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Saskatoon, SK", "remarks": "Saskatoon, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 900.0, "station": "CKBI", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Prince Albert, SK", "remarks": "Prince Albert, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 980.0, "station": "CJME", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Regina, SK", "remarks": "Regina, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1050.0, "station": "CJNB", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "North Battleford, SK", "remarks": "North Battleford, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1150.0, "station": "CJSL", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Estevan, SK", "remarks": "Estevan, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1190.0, "station": "CFSL", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Weyburn, SK", "remarks": "Weyburn, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1330.0, "station": "CJYM", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Rosetown, SK", "remarks": "Rosetown, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+    {"frequency_khz": 1490.0, "station": "CJSN", "itu": "CAN", "target": "Saskatchewan", "lang": "AM", "tx_display": "Shaunavon, SK", "remarks": "Shaunavon, SK", "persistence": "24h", "mode": "AM", "category": "am_broadcast"},
+]
+
+
+def _append_builtin_time_signal_rows(rows):
+    existing = set()
+    for row in rows:
+        try:
+            f = round(float(row.get("frequency_khz", 0.0)), 3)
+        except Exception:
+            continue
+        station = str(row.get("station", "") or "").strip().upper()
+        existing.add((f, station))
+
+    for item in _BUILTIN_TIME_SIGNAL_ROWS:
+        f = round(float(item["frequency_khz"]), 3)
+        station = str(item["station"]).strip()
+        key = (f, station.upper())
+        if key in existing:
+            continue
+        target_text = str(item.get("target", "") or "").strip()
+        tx_display = str(item.get("tx_display", "") or "").strip()
+        rows.append({
+            "frequency_khz": float(item["frequency_khz"]),
+            "frequency_text": f"{int(item['frequency_khz'])}" if float(item["frequency_khz"]).is_integer() else f"{item['frequency_khz']}",
+            "time_utc": "0000-2400",
+            "days": "Mo-Su",
+            "station": station,
+            "itu": str(item.get("itu", "") or "").strip(),
+            "target": target_text,
+            "target_display": shorten_desc(target_text, 24) if target_text else "",
+            "lang": str(item.get("lang", "TS") or "TS").strip(),
+            "remarks": tx_display,
+            "tx_display": shorten_desc(tx_display, 24) if tx_display else "",
+            "persistence": str(item.get("persistence", "24h") or "24h").strip(),
+            "start_date": "",
+            "stop_date": "",
+            "mode": str(item.get("mode", "AM") or "AM").strip().upper(),
+            "category": str(item.get("category", "time_signal") or "time_signal").strip(),
+            "note": str(item.get("note", "") or "").strip(),
+        })
+        existing.add(key)
+
+
+def _append_builtin_regional_am_rows(rows):
+    existing = set()
+    for row in rows:
+        try:
+            f = round(float(row.get("frequency_khz", 0.0)), 3)
+        except Exception:
+            continue
+        station = str(row.get("station", "") or "").strip().upper()
+        existing.add((f, station))
+
+    for item in _BUILTIN_WESTERN_CANADA_AM_ROWS:
+        f = round(float(item["frequency_khz"]), 3)
+        station = str(item["station"]).strip()
+        key = (f, station.upper())
+        if key in existing:
+            continue
+        target_text = str(item.get("target", "") or "").strip()
+        tx_display = str(item.get("tx_display", "") or "").strip()
+        rows.append({
+            "frequency_khz": float(item["frequency_khz"]),
+            "frequency_text": f"{int(item['frequency_khz'])}" if float(item["frequency_khz"]).is_integer() else f"{item['frequency_khz']}",
+            "time_utc": "0000-2400",
+            "days": "Mo-Su",
+            "station": station,
+            "itu": str(item.get("itu", "") or "").strip(),
+            "target": target_text,
+            "target_display": shorten_desc(target_text, 24) if target_text else "",
+            "lang": str(item.get("lang", "AM") or "AM").strip(),
+            "remarks": tx_display,
+            "tx_display": shorten_desc(tx_display, 24) if tx_display else "",
+            "persistence": str(item.get("persistence", "24h") or "24h").strip(),
+            "start_date": "",
+            "stop_date": "",
+            "mode": str(item.get("mode", "AM") or "AM").strip().upper(),
+            "category": str(item.get("category", "am_broadcast") or "am_broadcast").strip(),
+            "note": str(item.get("note", "") or "").strip(),
+        })
+        existing.add(key)
+
+    existing = set()
+    for row in rows:
+        try:
+            f = round(float(row.get("frequency_khz", 0.0)), 3)
+        except Exception:
+            continue
+        station = str(row.get("station", "") or "").strip().upper()
+        existing.add((f, station))
+
+    for item in _BUILTIN_TIME_SIGNAL_ROWS:
+        f = round(float(item["frequency_khz"]), 3)
+        station = str(item["station"]).strip()
+        key = (f, station.upper())
+        if key in existing:
+            continue
+        target_text = str(item.get("target", "") or "").strip()
+        tx_display = str(item.get("tx_display", "") or "").strip()
+        note = str(item.get("note", "") or "").strip()
+        rows.append({
+            "frequency_khz": float(item["frequency_khz"]),
+            "frequency_text": f"{int(item['frequency_khz'])}" if float(item["frequency_khz"]).is_integer() else f"{item['frequency_khz']}",
+            "time_utc": "0000-2400",
+            "days": "Mo-Su",
+            "station": station,
+            "itu": str(item.get("itu", "") or "").strip(),
+            "target": target_text,
+            "target_display": shorten_desc(target_text, 24) if target_text else "",
+            "lang": str(item.get("lang", "TS") or "TS").strip(),
+            "remarks": tx_display,
+            "tx_display": shorten_desc(tx_display, 24) if tx_display else "",
+            "persistence": str(item.get("persistence", "24h") or "24h").strip(),
+            "start_date": "",
+            "stop_date": "",
+        })
+        existing.add(key)
+
+def _init_shortwave_highlight_pairs() -> None:
+    if not curses.has_colors():
+        return
+    for color_name, color_value in _SHORTWAVE_HIGHLIGHT_COLOR_MAP.items():
+        pair_no = _SHORTWAVE_HIGHLIGHT_PAIR_MAP.get(color_name)
+        if pair_no is None:
+            continue
+        try:
+            curses.init_pair(pair_no, color_value, -1)
+        except Exception:
+            pass
+
+def _normalize_shortwave_target_text(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    return re.sub(r"[^A-Z0-9]+", "", s.upper())
+
+def _expand_shortwave_target_aliases(configured_target: str) -> set:
+    raw = str(configured_target or "").strip()
+    if not raw:
+        return set()
+    compact = _normalize_shortwave_target_text(raw)
+    aliases = {
+        "NAM": {"NAM", "NORTHAMERICA"},
+        "NORTHAMERICA": {"NAM", "NORTHAMERICA"},
+        "CAM": {"CAM", "CENTRALAMERICA"},
+        "CENTRALAMERICA": {"CAM", "CENTRALAMERICA"},
+        "SAM": {"SAM", "SOUTHAMERICA"},
+        "SOUTHAMERICA": {"SAM", "SOUTHAMERICA"},
+        "CAR": {"CAR", "CARIBBEAN"},
+        "CARIBBEAN": {"CAR", "CARIBBEAN"},
+        "EU": {"EU", "EUROPE"},
+        "EUR": {"EUR", "EU", "EUROPE"},
+        "EUROPE": {"EUR", "EU", "EUROPE"},
+        "AF": {"AF", "AFRICA"},
+        "AFRICA": {"AF", "AFRICA"},
+        "AS": {"AS", "ASIA"},
+        "ASI": {"ASI", "ASIA"},
+        "ASIA": {"ASI", "ASIA"},
+        "ME": {"ME", "MIDDLEEAST"},
+        "MIDDLEEAST": {"ME", "MIDDLEEAST"},
+        "OC": {"OC", "OCEANIA"},
+        "OCE": {"OCE", "OCEANIA"},
+        "OCEANIA": {"OC", "OCE", "OCEANIA"},
+        "PAC": {"PAC", "PACIFIC"},
+        "PACIFIC": {"PAC", "PACIFIC"},
+        "WORLD": {"WORLD", "WORLDWIDE", "GLOBAL"},
+        "WORLDWIDE": {"WORLD", "WORLDWIDE", "GLOBAL"},
+        "GLOBAL": {"WORLD", "WORLDWIDE", "GLOBAL"},
+    }
+    return aliases.get(compact, {compact})
+
+def _shortwave_target_matches_filter(row_target_value: str, configured_target: str) -> bool:
+    row_text = str(row_target_value or "").strip()
+    configured = str(configured_target or "").strip()
+    if not row_text or not configured:
+        return False
+
+    row_upper = row_text.upper()
+    row_compact = _normalize_shortwave_target_text(row_text)
+    markers = _expand_shortwave_target_aliases(configured)
+
+    for marker in markers:
+        if not marker:
+            continue
+        marker_upper = marker.upper()
+        marker_compact = _normalize_shortwave_target_text(marker)
+        if marker_upper in row_upper:
+            return True
+        if marker_compact and marker_compact in row_compact:
+            return True
+    return False
+
+def _shortwave_target_is_north_america(target_value: str) -> bool:
+    return _shortwave_target_matches_filter(target_value, "North America")
+
+def _get_shortwave_highlight_attr(cfg) -> int:
+    color_name = str(getattr(cfg, "shortwave_highlight_color", "cyan") or "cyan").strip().lower()
+    pair_no = _SHORTWAVE_HIGHLIGHT_PAIR_MAP.get(color_name, _SHORTWAVE_HIGHLIGHT_PAIR_MAP["cyan"])
+    try:
+        if curses.has_colors():
+            return curses.color_pair(pair_no) | curses.A_BOLD
+    except Exception:
+        pass
+    return curses.A_BOLD
+
+
+def _get_shortwave_time_signal_attr() -> int:
+    try:
+        if curses.has_colors():
+            return curses.color_pair(_SHORTWAVE_HIGHLIGHT_PAIR_MAP.get("magenta", 27)) | curses.A_BOLD
+    except Exception:
+        pass
+    return curses.A_BOLD
+
+def _is_shortwave_time_signal_row(row: dict) -> bool:
+    if str(row.get("category", "") or "").strip().lower() == "time_signal":
+        return True
+    station = str(row.get("station", "") or "").upper()
+    return ("WWV" in station) or ("WWVH" in station) or ("CHU" in station)
+
+
+def _shortwave_is_in_broadcast_band(freq_khz: float) -> bool:
+    try:
+        f = float(freq_khz)
+    except Exception:
+        return False
+    for low, high in _SHORTWAVE_BROADCAST_BANDS_KHZ:
+        if low <= f <= high:
+            return True
+    return False
+
+def _shortwave_clean_tx_desc(desc: str) -> str:
+    s = re.sub(r"\s+", " ", str(desc or "")).strip()
+    s = re.sub(r"^[a-zA-Z0-9]{1,3}\s*-\s*", "", s)
+    s = re.sub(r"\([^)]*\)", "", s).strip(" -,:;")
+    s = re.sub(r"\s+[0-9]{1,2}[NS][0-9].*$", "", s).strip(" -,:;")
+    return s
+
+def _shortwave_extract_city_country(desc: str, itu_code: str = "") -> str:
+    s = _shortwave_clean_tx_desc(desc)
+    if not s:
+        return ""
+    s = s.replace(" / ", "/")
+    pieces = [p.strip(" -") for p in s.split("/") if p.strip(" -")]
+    city = pieces[0] if pieces else s
+    country = ""
+    itu_country = {
+        "USA": "USA", "CAN": "Canada", "GBR": "UK", "D": "Germany", "DEU": "Germany",
+        "UAE": "UAE", "F": "France", "KWT": "Kuwait", "ASC": "Ascension", "CLN": "Sri Lanka"
+    }
+    city = re.sub(r"\s{2,}", " ", city).strip(" -,:;")
+    if itu_code.upper() in ("USA", "CAN") or re.search(r",\s*[A-Z]{2}$", city):
+        return shorten_desc(city, 24)
+    if len(pieces) > 1:
+        country = pieces[-1].strip(" -,:;")
+    if not country:
+        country = itu_country.get(itu_code.upper(), "")
+    if country and city and country.lower() != city.lower():
+        return shorten_desc(f"{country} / {city}", 24)
+    return shorten_desc(city or s, 24)
+
+def _shortwave_tx_label(itu_code: str, tx_code: str) -> str:
+    itu_code = str(itu_code or "").strip().upper()
+    tx_code = _shortwave_clean_csv_field(tx_code)
+    if not tx_code:
+        return ""
+    desc = SHORTWAVE_TX_SITE_CODE_MAP.get(f"{itu_code}:{tx_code}", "")
+    if not desc and ":" in tx_code:
+        desc = SHORTWAVE_TX_SITE_CODE_MAP.get(tx_code.upper(), "")
+    if desc:
+        short = _shortwave_extract_city_country(desc, itu_code)
+        if short:
+            return short
+    return tx_code
+
+def _shortwave_expand_day_tokens(days_value: str):
+    s = str(days_value or "").strip()
+    if not s:
+        return set(range(7))
+    s = s.replace(" ", "")
+    day_map = {"Mo": 0, "Tu": 1, "We": 2, "Th": 3, "Fr": 4, "Sa": 5, "Su": 6}
+    allowed = set()
+    for token, rng in [("Mo-Fr", range(0, 5)), ("Mo-Sa", range(0, 6)), ("Mo-Su", range(0, 7)),
+                       ("Tu-Sa", range(1, 6)), ("SaSu", [5, 6]), ("Su", [6]), ("Sa", [5])]:
+        if token in s:
+            allowed.update(rng)
+            s = s.replace(token, "")
+    for token, idx in day_map.items():
+        if token in s:
+            allowed.add(idx)
+            s = s.replace(token, "")
+    return allowed or set(range(7))
+
+def _shortwave_time_match(now_utc, time_range: str) -> bool:
+    s = str(time_range or "").strip()
+    m = re.fullmatch(r"(\d{4})-(\d{4})", s)
+    if not m:
+        return False
+    start = int(m.group(1)[:2]) * 60 + int(m.group(1)[2:])
+    stop = int(m.group(2)[:2]) * 60 + int(m.group(2)[2:])
+    now_min = now_utc.hour * 60 + now_utc.minute
+    if start == stop:
+        return True
+    if start < stop:
+        return start <= now_min < stop
+    return now_min >= start or now_min < stop
+
+def _load_shortwave_rows_for_now(cfg: AppConfig):
+    path = _find_shortwave_schedule_path(cfg)
+    if not path:
+        return [], "Shortwave schedule not found"
+    now_local = datetime.now().astimezone()
+    now_utc = now_local.astimezone(timezone.utc)
+    rows = []
+    allowed_langs = _get_shortwave_language_filter(cfg)
+    try:
+        with open(path, "r", encoding="latin1", errors="ignore") as f:
+            for line_no, raw in enumerate(f):
+                if line_no == 0:
+                    continue
+                line = raw.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                parts = line.split(";")
+                if len(parts) < 11:
+                    parts += [""] * (11 - len(parts))
+                elif len(parts) > 11:
+                    parts = parts[:10] + [";".join(parts[10:])]
+                freq, time_utc, days, itu, station, lang, target, tx_site, persistence, start, stop = parts[:11]
+                if not _shortwave_lang_matches(lang, allowed_langs):
+                    continue
+                if now_utc.weekday() not in _shortwave_expand_day_tokens(days):
+                    continue
+                if not _shortwave_time_match(now_utc, time_utc):
+                    continue
+                try:
+                    freq_val = float(str(freq).strip())
+                except Exception:
+                    continue
+                if getattr(cfg, "shortwave_broadcast_bands_only", True):
+                    if not _shortwave_is_in_broadcast_band(freq_val):
+                        continue
+                itu_clean = str(itu).strip()
+                target_clean = _shortwave_clean_csv_field(target)
+                tx_clean = _shortwave_clean_csv_field(tx_site)
+                rows.append({
+                    "frequency_khz": freq_val,
+                    "frequency_text": str(freq).strip(),
+                    "time_utc": str(time_utc).strip(),
+                    "days": _shortwave_clean_csv_field(days),
+                    "station": str(station).strip(),
+                    "itu": itu_clean,
+                    "target": target_clean,
+                    "target_display": _shortwave_target_label(target_clean),
+                    "lang": _shortwave_clean_csv_field(lang),
+                    "remarks": tx_clean,
+                    "tx_display": _shortwave_tx_label(itu_clean, tx_clean),
+                    "persistence": _shortwave_clean_csv_field(persistence),
+                    "start_date": _shortwave_clean_csv_field(start),
+                    "stop_date": _shortwave_clean_csv_field(stop),
+                    "mode": "AM",
+                    "category": "schedule",
+                    "note": "",
+                })
+    except Exception as e:
+        return [], f"Shortwave load failed: {e}"
+    _append_builtin_time_signal_rows(rows)
+    _append_builtin_regional_am_rows(rows)
+    rows.sort(key=lambda r: (r["frequency_khz"], r["station"]))
+    lang_label = ",".join(allowed_langs) if allowed_langs else "ALL"
+    stamp = f"Now: {now_local.strftime('%Y-%m-%d %H:%M %Z')} / {now_utc.strftime('%H:%M UTC')}  Languages: {lang_label}  Count: {len(rows)}"
+    return rows, stamp
+
+def refresh_shortwave_view(cfg: AppConfig, state: AppState) -> None:
+    rows, status = _load_shortwave_rows_for_now(cfg)
+    old_key = getattr(state, "shortwave_last_refresh_key", "")
+    new_key = "|".join(f"{r['frequency_text']}|{r['time_utc']}|{r.get('lang','')}|{r['station']}|{r.get('target_display','')}|{r.get('tx_display','')}" for r in rows) + "||" + status
+    state.shortwave_rows = rows
+    state.shortwave_last_refresh_key = new_key
+    if not rows:
+        state.shortwave_selected_idx = 0
+    else:
+        state.shortwave_selected_idx = max(0, min(int(getattr(state, "shortwave_selected_idx", 0) or 0), len(rows) - 1))
+    if old_key != new_key:
+        state.dirty_map = True
+    if getattr(state, "shortwave_mode", False):
+        state.status_line = status
+        state.dirty_status = True
+
+def _move_shortwave_selection(state: AppState, delta: int) -> None:
+    rows = list(getattr(state, "shortwave_rows", []) or [])
+    if not rows:
+        state.shortwave_selected_idx = 0
+        return
+    idx = int(getattr(state, "shortwave_selected_idx", 0) or 0) + int(delta)
+    state.shortwave_selected_idx = max(0, min(len(rows) - 1, idx))
+    state.dirty_map = True
+
+def tune_rig_to_selected_shortwave(cfg: AppConfig, state: AppState) -> bool:
+    rows = list(getattr(state, "shortwave_rows", []) or [])
+    idx = int(getattr(state, "shortwave_selected_idx", 0) or 0)
+    if idx < 0 or idx >= len(rows):
+        state.status_line = "No shortwave station selected"
+        state.dirty_status = True
+        return False
+    row = rows[idx]
+    freq_hz = int(round(float(row["frequency_khz"]) * 1000.0))
+    mode_name = str(row.get("mode", "AM") or "AM").strip().upper()
+    if mode_name == "USB":
+        mode_bw = 2400
+    elif mode_name == "LSB":
+        mode_bw = 2400
+    else:
+        mode_bw = 6000
+    freq_ok = set_rigctld_frequency(cfg, state, freq_hz)
+    mode_ok = set_rigctld_mode(cfg, state, mode_name, mode_bw)
+    if freq_ok and mode_ok:
+        state.status_line = f"Shortwave tuned: {row['frequency_text']} kHz {mode_name} - {row['station']}"
+        state.dirty_status = True
+        return True
+    if freq_ok:
+        state.status_line = f"Frequency set to {row['frequency_text']} kHz, but {mode_name} mode failed"
+        state.dirty_status = True
+    return False
+
+def draw_shortwave_panel(win, state: AppState) -> None:
+    try:
+        h, w = win.getmaxyx()
+    except Exception:
+        return
+    inner_h = max(1, h - 2)
+    inner_w = max(1, w - 2)
+    rows = list(getattr(state, "shortwave_rows", []) or [])
+    selected_idx = int(getattr(state, "shortwave_selected_idx", 0) or 0)
+    win.erase()
+    win.box()
+    safe_addstr(win, 0, 2, " Shortwave Radio ", curses.A_BOLD)
+    if inner_h <= 0:
+        win.noutrefresh()
+        return
+
+    help_line = "Up/Down=Select  Enter=Tune listed mode  S=Hide"
+    safe_addstr(win, 1, 1, help_line[:inner_w], curses.A_DIM)
+
+    header_row = 2
+    data_start_row = 3
+    col_header = "  Freq    UTC        Lang  Target                    TxSite                    Station"
+    if inner_h >= 2:
+        safe_addstr(win, header_row, 1, col_header[:inner_w], curses.A_BOLD | curses.A_UNDERLINE)
+
+    if not rows:
+        msg_row = min(max(1, data_start_row), h - 2)
+        safe_addstr(win, msg_row, 1, "No matching shortwave broadcast stations on air now."[:inner_w])
+        win.noutrefresh()
+        return
+
+    visible_rows = max(1, inner_h - data_start_row)
+    top = 0
+    if selected_idx >= visible_rows:
+        top = selected_idx - visible_rows + 1
+
+    for screen_row, row in enumerate(rows[top: top + visible_rows], start=data_start_row):
+        absolute_idx = top + screen_row - data_start_row
+        cfg = getattr(state, "cfg", None)
+        highlight_target = str(getattr(cfg, "shortwave_highlight_target", "North America") or "North America").strip()
+        row_target_raw = str(row.get("target", "") or "").strip()
+        row_target_display = str(row.get("target_display", "") or "").strip()
+        row_target_value = " | ".join(v for v in [row_target_raw, row_target_display] if v)
+        is_highlight_target = _shortwave_target_matches_filter(row_target_value, highlight_target)
+
+        if absolute_idx == selected_idx:
+            style = curses.A_REVERSE | curses.A_BOLD
+        elif _is_shortwave_time_signal_row(row):
+            style = _get_shortwave_time_signal_attr()
+        elif is_highlight_target:
+            style = _get_shortwave_highlight_attr(cfg)
+        else:
+            style = curses.A_NORMAL
+
+        target = str(row.get("target_display", row.get("target", "")) or "")[:24]
+        txsite = str(row.get("tx_display", row.get("remarks", "")) or "")[:24]
+        station = str(row.get("station", "") or "")
+        lang = str(row.get("lang", "") or "")[:4]
+        line = f"{row['frequency_text']:>7}  {row['time_utc']:<9}  {lang:<4}  {target:<24}  {txsite:<24}  {station}"
+        safe_addstr(win, screen_row, 1, line[:inner_w], style)
+    win.noutrefresh()
+
+
 def show_help_screen(stdscr, state: AppState):
     """Show keyboard help. Close with F1 or Esc."""
     lines = [
@@ -5265,7 +6072,13 @@ def show_help_screen(stdscr, state: AppState):
         "  F1 = Show this help screen",
         "  Esc = Open the File menu",
         "  L = Toggle Logbook mode on/off",
+        "  S = Toggle Shortwave Radio panel",
         "  Q = Quit the program",
+        "",
+        "Shortwave panel",
+        "  Up/Down = Select station on air now",
+        "  Enter = Tune selected station in its listed mode",
+        "  S = Return to map/logbook view",
         "",
         "Logbook mode",
         "  N = New QSO entry",
@@ -5559,6 +6372,7 @@ def edit_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
                 cfg.grid_square = values.get("grid_square", "").strip()
                 cfg.local_weather_refresh_sec = float(values.get("local_weather_refresh_sec", "1800") or "1800")
                 cfg.time_zone = values.get("time_zone", "").strip() or "America/Edmonton"
+                cfg.shortwave_languages = values.get("shortwave_languages", "").strip() or "E"
                 save_config(cfg)
                 apply_config_runtime(cfg, state)
                 state.status_line = "Settings saved and applied"
@@ -5992,6 +6806,7 @@ def main(stdscr):
     cfg = load_config()
     set_logging_enabled(getattr(cfg, "enable_logging", True))
     state = AppState()
+    state.cfg = cfg
     state.rig_frequency = "-"
     state.rig_mode = "-"
     state.rig_status_line = "Radio: disabled"
@@ -6005,6 +6820,7 @@ def main(stdscr):
         edit_settings_dialog(stdscr, cfg, state)
         # Reload from disk to ensure type conversions are applied consistently.
         cfg = load_config()
+        state.cfg = cfg
 
     initialize_online_lookup_session(cfg, state)
 
@@ -6018,6 +6834,10 @@ def main(stdscr):
         try:
             curses.init_pair(20, curses.COLOR_WHITE, -1)
             curses.init_pair(21, curses.COLOR_BLACK, -1)
+        except Exception:
+            pass
+        try:
+            _init_shortwave_highlight_pairs()
         except Exception:
             pass
 
@@ -6092,12 +6912,14 @@ def main(stdscr):
     update_space_weather(state, panel_inner_w=space_inner_w)
     update_weather_open_meteo(cfg, state)
     update_time_lines(state)
+    refresh_shortwave_view(cfg, state)
 
     last_refresh = 0.0
     last_wx_refresh = 0.0
     last_map_refresh = 0.0
     last_time_refresh = 0.0
     last_rig_refresh = 0.0
+    last_shortwave_refresh = 0.0
 
     while state.running:
         now = time.time()
@@ -6128,6 +6950,10 @@ def main(stdscr):
         if (now - last_rig_refresh) >= rig_poll_sec:
             poll_rigctld_once(cfg, state)
             last_rig_refresh = now
+
+        if (now - last_shortwave_refresh) >= 60.0:
+            refresh_shortwave_view(cfg, state)
+            last_shortwave_refresh = now
 
         # input
         k = stdscr.getch()
@@ -6168,6 +6994,14 @@ def main(stdscr):
                 update_space_weather(state, panel_inner_w=space_inner_w)
                 update_weather_open_meteo(cfg, state)
                 update_time_lines(state)
+            elif k in (ord('s'), ord('S')):
+                state.shortwave_mode = not state.shortwave_mode
+                state.dirty_map = True
+                if state.shortwave_mode:
+                    refresh_shortwave_view(cfg, state)
+                else:
+                    state.status_line = "Shortwave Radio panel OFF"
+                    state.dirty_status = True
             elif k in (ord('l'), ord('L')):
                 state.logging_mode = not state.logging_mode
                 if state.logging_mode:
@@ -6180,7 +7014,12 @@ def main(stdscr):
                         state.selected_station_callsign_id = None
                         state.selected_station_callsign = ""
                         state.logbook_lines = [
-                            "Logbook mode",
+                            "Shortwave panel",
+        "  Up/Down = Select station on air now",
+        "  Enter = Tune selected station in its listed mode",
+        "  S = Return to map/logbook view",
+        "",
+        "Logbook mode",
                             "",
                             "Database/schema error:",
                             str(e),
@@ -6244,19 +7083,25 @@ def main(stdscr):
                 if state.logging_mode:
                     delete_selected_qso_dialog(stdscr, cfg, state)
             elif _is_dx_up_key(k):
-                if state.logging_mode:
+                if state.shortwave_mode:
+                    _move_shortwave_selection(state, -1)
+                elif state.logging_mode:
                     _move_logbook_selection(state, -1)
                     refresh_logbook_lines(cfg, state)
                 else:
                     _dx_move_selection(state, -1)
             elif _is_dx_down_key(k):
-                if state.logging_mode:
+                if state.shortwave_mode:
+                    _move_shortwave_selection(state, 1)
+                elif state.logging_mode:
                     _move_logbook_selection(state, 1)
                     refresh_logbook_lines(cfg, state)
                 else:
                     _dx_move_selection(state, 1)
             elif _is_dx_enter_key(k):
-                if not state.logging_mode:
+                if state.shortwave_mode:
+                    tune_rig_to_selected_shortwave(cfg, state)
+                elif not state.logging_mode:
                     tune_rig_to_selected_dx(cfg, state)
             elif k in (ord('q'), ord('Q')):
                 state.running = False
@@ -6315,7 +7160,12 @@ def main(stdscr):
             draw_box_contents(w_dedx, dedx_lines, "DE / DX")
             state.dirty_dedx = False
 
-        if state.logging_mode:
+        if state.shortwave_mode:
+            if state.dirty_map:
+                draw_shortwave_panel(w_map, state)
+                state.dirty_map = False
+                state.dirty_logbook = False
+        elif state.logging_mode:
             if state.dirty_map or state.dirty_logbook:
                 draw_box_contents(w_map, state.logbook_lines, "Logbook")
                 state.dirty_map = False
