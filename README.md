@@ -62,3 +62,5 @@ November 24/2026 changes (bug fixes and cleanup)
 - hamclock_settings.json is no longer tracked in git.  Use hamclock_settings.example.json as a starting point.
 - Removed duplicate and dead code.
 - "? or F1 = Help  Esc = Menu" hint on the map panel border.  ? opens help too, and F1 now works from PuTTY's default keyboard setting.
+- When rig control is off the Radio box is hidden and the DE / DX panel uses its space.  The DE / DX panel switches to a compact layout when it's short on room, so both DE and DX fit on a 24-line terminal.
+- Esc in the Rig Control dialog now cancels changes instead of keeping them.

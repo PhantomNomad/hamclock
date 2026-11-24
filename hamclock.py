@@ -161,6 +161,7 @@ class AppState:
     wx_static_lines: List[str] = field(default_factory=list)   # non-time lines
     wx_time_lines: List[str] = field(default_factory=list)     # local/utc only
     dedx_lines: List[str] = field(default_factory=list)
+    dedx_spot_info: Optional[Tuple[dict, dict]] = None
     dedx_lookup_cache: dict = field(default_factory=dict)
     dedx_lookup_lock: "threading.Lock" = field(default_factory=threading.Lock)
 
@@ -207,6 +208,7 @@ class AppState:
     rig_nr: Optional[bool] = None
     rig_unsupported: set = field(default_factory=set)
     rig_status_line: str = "Radio: disabled"
+    layout_rig_enabled: bool = False
     dirty_rig: bool = True
     shortwave_mode: bool = False
     shortwave_rows: List[dict] = field(default_factory=list)
@@ -1887,6 +1889,7 @@ def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
         ("rigctld_port", "rigctld Port", "int"),
         ("rigctld_poll_ms", "Poll Interval ms", "int"),
     ]
+    original = {key: getattr(cfg, key, None) for key, _, _ in fields}
     idx = 0
     curses.curs_set(0)
     stdscr.nodelay(False)
@@ -1919,6 +1922,9 @@ def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
         k = win.getch()
 
         if k in (27,):
+            # Esc = cancel: put back anything toggled or typed in this dialog
+            for key, value in original.items():
+                setattr(cfg, key, value)
             try:
                 win.erase()
                 win.noutrefresh()
@@ -1934,6 +1940,7 @@ def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
             idx = min(len(fields) - 1, idx + 1)
         elif k in (ord("s"), ord("S")):
             save_config(cfg)
+            state.rig_unsupported.clear()
             poll_rigctld_once(cfg, state)
             try:
                 win.erase()
@@ -4980,7 +4987,16 @@ def _dedx_field(label: str, value: str, width: int) -> str:
 
 
 def build_dedx_lines(state: AppState, width: int, height: int) -> List[str]:
-    if state.dedx_lines:
+    info = getattr(state, "dedx_spot_info", None)
+    if info:
+        # Use the roomiest layout that still shows both DE and DX.
+        de_info, dx_info = info
+        lines = _dedx_layout_full(de_info, dx_info)
+        if len(lines) > height:
+            lines = _dedx_layout_medium(de_info, dx_info)
+        if len(lines) > height:
+            lines = _dedx_layout_compact(de_info, dx_info)
+    elif state.dedx_lines:
         lines = list(state.dedx_lines)
     else:
         lines = [
@@ -5213,8 +5229,13 @@ def update_dedx_panel_from_spot(cfg: AppConfig, state: AppState, raw_text: str) 
     de_info = get_cached_callsign_info(cfg, state, spot["spotter"])
     dx_info = get_cached_callsign_info(cfg, state, spot["spotted"])
 
-    lines = []
+    state.dedx_spot_info = (dict(de_info or {}), dict(dx_info or {}))
+    state.dedx_lines = _dedx_layout_full(de_info or {}, dx_info or {})
+    state.dirty_dedx = True
 
+
+def _dedx_layout_full(de_info: dict, dx_info: dict) -> List[str]:
+    lines: List[str] = []
     for heading, info in (("DE", de_info), ("DX", dx_info)):
         lines.extend([
             "",
@@ -5226,9 +5247,44 @@ def update_dedx_panel_from_spot(cfg: AppConfig, state: AppState, raw_text: str) 
             _dedx_field("Country", info.get("country", ""), 999),
             _dedx_field("DB", info.get("source", ""), 999),
         ])
+    return lines
 
-    state.dedx_lines = lines
-    state.dirty_dedx = True
+
+def _dedx_layout_medium(de_info: dict, dx_info: dict) -> List[str]:
+    # 13 lines: callsign on the heading line, no leading blanks
+    lines: List[str] = []
+    for heading, info in (("DE", de_info), ("DX", dx_info)):
+        if lines:
+            lines.append("")
+        call = _clean_lookup_value(info.get("callsign", "")) or "-"
+        lines.extend([
+            f"{heading}: {call}",
+            _dedx_field("Name", info.get("name", ""), 999),
+            _dedx_field("City", info.get("city", ""), 999),
+            _dedx_field("Prov/St", info.get("prov_state", ""), 999),
+            _dedx_field("Country", info.get("country", ""), 999),
+            _dedx_field("DB", info.get("source", ""), 999),
+        ])
+    return lines
+
+
+def _dedx_layout_compact(de_info: dict, dx_info: dict) -> List[str]:
+    # 9 lines: city and prov/state share a line, source goes on the heading
+    lines: List[str] = []
+    for heading, info in (("DE", de_info), ("DX", dx_info)):
+        if lines:
+            lines.append("")
+        call = _clean_lookup_value(info.get("callsign", "")) or "-"
+        src = _clean_lookup_value(info.get("source", ""))
+        qth = ", ".join(p for p in (_clean_lookup_value(info.get("city", "")),
+                                    _clean_lookup_value(info.get("prov_state", ""))) if p)
+        lines.extend([
+            f"{heading}: {call}" + (f"  [{src}]" if src else ""),
+            _dedx_field("Name", info.get("name", ""), 999),
+            _dedx_field("QTH", qth, 999),
+            _dedx_field("Country", info.get("country", ""), 999),
+        ])
+    return lines
 
 
 def dedx_lookup_worker(cfg: AppConfig, state: AppState) -> None:
@@ -7004,11 +7060,16 @@ def main(stdscr):
         dedx_w = max(20, maxx // 3)
         map_w = max(20, maxx - dedx_w)
 
-        rig_h = min(6, map_h)
+        # With rig control off, the DE / DX panel takes the Radio box's rows.
+        state.layout_rig_enabled = bool(getattr(cfg, "rig_control_enabled", False))
+        if state.layout_rig_enabled:
+            rig_h = min(6, map_h)
+            w_rig = curses.newwin(rig_h, dedx_w, map_start_y, 0)
+            box_title(w_rig, "Radio")
+        else:
+            rig_h = 0
+            w_rig = None
         dedx_h = max(3, map_h - rig_h)
-
-        w_rig = curses.newwin(rig_h, dedx_w, map_start_y, 0)
-        box_title(w_rig, "Radio")
 
         w_dedx = curses.newwin(dedx_h, dedx_w, map_start_y + rig_h, 0)
         box_title(w_dedx, "DE / DX")
@@ -7058,6 +7119,13 @@ def main(stdscr):
 
     while state.running:
         now = time.time()
+
+        # Rig control switched on/off in Esc > Rig Control: rebuild the layout.
+        if bool(getattr(cfg, "rig_control_enabled", False)) != state.layout_rig_enabled:
+            stdscr.erase()
+            stdscr.noutrefresh()
+            w_space, w_dx, w_wx, w_rig, w_dedx, w_map = build_windows()
+            state.dirty_logbook = True
 
         # DX spot map overlay disabled: leave base world map rendering unchanged.
 
@@ -7229,6 +7297,8 @@ def main(stdscr):
             state.dirty_wx_static = False
             state.dirty_wx_time = False
 
+        if state.dirty_rig and w_rig is None:
+            state.dirty_rig = False
         if state.dirty_rig:
             h_rig, w_rig_inner = w_rig.getmaxyx()
             inner_w = max(1, w_rig_inner - 2)
