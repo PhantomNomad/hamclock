@@ -14,7 +14,7 @@ time_refresh_seconds: Default is one second so it makes the clock tick.
 dx_cluster_host/port/username/password, dx_filter: Your DX cluster login.  Set from Esc > DX Cluster.
 enable_logging: Debug log to hamclock.log.  Off by default because it gets huge.
 
-Pressing ESC will bring up the menu (Settings, Rig Control, DX Cluster, Local Database, Shortwave, Online lookup, Look up call sign, Quit).  You can also just press "q" while it's running to quit.
+Press ? (or F1) for a help screen listing every key.  The hint is shown in the bottom border of the map panel.  Pressing ESC will bring up the menu (Settings, Rig Control, DX Cluster, Local Database, Shortwave, Online lookup, Look up call sign, Quit).  You can also just press "q" while it's running to quit.
 
 If HTTPS fetches fail with certificate errors, fix the Pi's certificates with "sudo apt install --reinstall ca-certificates".  As a last resort MYHAMCLOCK_INSECURE_SSL=1 turns off certificate checks.
 
@@ -61,3 +61,4 @@ November 24/2026 changes (bug fixes and cleanup)
 - Debug logging is off by default.
 - hamclock_settings.json is no longer tracked in git.  Use hamclock_settings.example.json as a starting point.
 - Removed duplicate and dead code.
+- "? or F1 = Help  Esc = Menu" hint on the map panel border.  ? opens help too, and F1 now works from PuTTY's default keyboard setting.

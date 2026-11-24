@@ -2528,6 +2528,56 @@ def box_title(win, title: str):
     safe_addstr(win, 0, 2, f" {title} ")
 
 
+KEY_HINT = " ? or F1 = Help   Esc = Menu "
+
+
+def draw_key_hint(win, hint: str = KEY_HINT) -> None:
+    """Write the key hint into the bottom-right of a panel's border."""
+    try:
+        h, w = win.getmaxyx()
+    except Exception:
+        return
+    if h < 3 or w < 12:
+        return
+    text = hint if len(hint) <= w - 4 else " ? = Help "
+    if len(text) > w - 4:
+        return
+    safe_addstr(win, h - 1, w - 2 - len(text), text, curses.A_BOLD)
+
+
+# Function keys some terminals send that curses may not recognise for the
+# current TERM. PuTTY's default keyboard mode sends ESC [ 1 1 ~ for F1.
+_ESC_TAIL_F1 = ("[11~", "OP", "[[A")
+
+
+def read_escape_tail(win) -> str:
+    """After getch() returned a bare Esc, collect any bytes that followed it.
+
+    Returns "" for a real Esc key press, or the rest of an escape sequence
+    curses didn't decode (e.g. "[11~" for F1 from PuTTY).
+    """
+    tail = []
+    try:
+        win.nodelay(True)
+        while len(tail) < 8:
+            ch = win.getch()
+            if ch == -1:
+                break
+            if 0 <= ch < 256:
+                tail.append(chr(ch))
+            else:
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            win.nodelay(False)
+            win.timeout(100)
+        except Exception:
+            pass
+    return "".join(tail)
+
+
 def clear_interior(win):
     h, w = win.getmaxyx()
     blank = " " * max(1, w - 2)
@@ -6140,13 +6190,13 @@ def draw_shortwave_panel(win, state: AppState) -> None:
 
 
 def show_help_screen(stdscr, state: AppState):
-    """Show keyboard help. Close with F1 or Esc."""
+    """Show keyboard help. Close with F1, ?, q or Esc."""
     lines = [
-        "F1 = Close help",
-        "Esc = Close help",
+        "F1, ?, Q or Esc = Close help",
+        "Up/Down, PgUp/PgDn = Scroll",
         "",
         "Main screen",
-        "  F1 = Show this help screen",
+        "  ? or F1 = Show this help screen",
         "  Esc = Open the File menu",
         "  L = Toggle Logbook mode on/off",
         "  S = Toggle Shortwave Radio panel",
@@ -6220,7 +6270,10 @@ def show_help_screen(stdscr, state: AppState):
         win.refresh()
         k = win.getch()
 
-        if k in (curses.KEY_F1, 27):
+        if k == 27:
+            read_escape_tail(win)  # swallow the rest of PuTTY's F1, if that's what it was
+            break
+        if k in (curses.KEY_F1, ord('?'), ord('q'), ord('Q')):
             break
         elif k == curses.KEY_UP:
             top = max(0, top - 1)
@@ -7025,6 +7078,14 @@ def main(stdscr):
 
         # input
         k = stdscr.getch()
+        if k == 27:
+            tail = read_escape_tail(stdscr)
+            if tail in _ESC_TAIL_F1:
+                k = curses.KEY_F1
+            elif tail:
+                k = -1  # some other unrecognised key; don't treat it as Esc
+        if k == ord('?'):
+            k = curses.KEY_F1
         if k is not None and k != -1:
             if k == curses.KEY_RESIZE:
                 stdscr.erase()
@@ -7212,11 +7273,15 @@ def main(stdscr):
         if state.shortwave_mode:
             if state.dirty_map:
                 draw_shortwave_panel(w_map, state)
+                draw_key_hint(w_map)
+                w_map.noutrefresh()
                 state.dirty_map = False
                 state.dirty_logbook = False
         elif state.logging_mode:
             if state.dirty_map or state.dirty_logbook:
                 draw_box_contents(w_map, state.logbook_lines, "Logbook")
+                draw_key_hint(w_map)
+                w_map.noutrefresh()
                 state.dirty_map = False
                 state.dirty_logbook = False
         elif state.dirty_map:
@@ -7237,6 +7302,7 @@ def main(stdscr):
             for i in range(min(inner_h, len(lines))):
                 add_ansi_str(w_map, 1 + i, 1, lines[i], inner_w)
 
+            draw_key_hint(w_map)
             w_map.noutrefresh()
             state.dirty_map = False
 
