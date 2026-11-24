@@ -121,6 +121,7 @@ class AppConfig:
 
     time_refresh_seconds: float = 1.0
     enable_logging: bool = False
+    hamcall_maintenance_done: bool = False
 
     online_lookup_website: str = "hamdb.org"
     online_lookup_username: str = ""
@@ -4472,73 +4473,130 @@ def _hamcall_extras_json(info: dict, columns) -> str:
     return json.dumps(extras, ensure_ascii=False, sort_keys=True) if extras else ""
 
 
-def cleanup_hamcall_blobs(cfg: AppConfig) -> int:
-    """One-time tidy of hamcall_calls rows saved by older versions.
+def _tidy_hamcall_row(raw, data_json, interest, fcc_id, cols) -> dict:
+    """Column updates that strip an old-style lookup row (see maintain_hamcall_calls)."""
+    extras = {}
+    bio = serial = None
+    raw = raw or ""
+    if not raw.lstrip().startswith("<"):
+        try:
+            raw = (json.loads(data_json or "{}") or {}).get("raw", "") or ""
+        except Exception:
+            raw = ""
+    if raw.lstrip().startswith("<"):
+        try:
+            root = ET.fromstring(raw.encode("utf-8"))
+            extras = _qrz_extras(root)
+            bio = _clean_lookup_value(_xml_findtext_ns_agnostic(root, "Callsign/bio", ""))
+            serial = _clean_lookup_value(_xml_findtext_ns_agnostic(root, "Callsign/serial", ""))
+        except Exception:
+            pass
+    sets = {"raw": "", "data_json": json.dumps(extras, ensure_ascii=False, sort_keys=True) if extras else ""}
+    if "interest_profile" in cols and bio and str(interest or "") == bio:
+        sets["interest_profile"] = ""
+    if "fcc_licensee_id" in cols and serial and str(fcc_id or "") == serial:
+        sets["fcc_licensee_id"] = ""
+    return sets
 
-    Those rows held the whole QRZ/HamQTH XML reply (with the login session
-    key) in raw and again inside data_json, and put QRZ's <serial>/<bio> in
-    fcc_licensee_id/interest_profile. Strip that, keeping a small JSON of the
-    useful QRZ extras. Rows that came with the database are left alone.
-    Returns the number of rows changed.
+
+_OLD_BLOB_WHERE = "(raw LIKE '<%' OR data_json LIKE '%\"session_id\"%' OR data_json LIKE '%\"raw\"%')"
+
+
+def maintain_hamcall_calls(cfg: AppConfig, batch_rows: int = 5000) -> int:
+    """One-time housekeeping for the lookup table, run in the background.
+
+    - Adds an index on UPPER(callsign): every lookup searches by it, and
+      without one each search reads the whole table.
+    - Strips rows saved by older versions, which held the whole QRZ/HamQTH
+      XML reply (with the login session key) in raw and again in data_json,
+      and put QRZ's <serial>/<bio> in fcc_licensee_id/interest_profile.
+
+    Works through the table a few thousand rows at a time and commits after
+    each batch, so lookups saving at the same time only wait a moment.
+    On SQLite, secure_delete overwrites the old text as it's replaced.
+    Returns the number of rows tidied.
     """
-    conn = _db_connect_cfg(cfg)
     changed = 0
+    if _db_is_mysql_cfg(cfg):
+        conn = _db_connect_cfg(cfg)
+        try:
+            cols = _table_columns_generic(conn, "hamcall_calls")
+            if not {"raw", "data_json", "callsign"} <= cols:
+                return 0
+            ph = _db_param()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT callsign, raw, data_json, "
+                + ("interest_profile" if "interest_profile" in cols else "''") + ", "
+                + ("fcc_licensee_id" if "fcc_licensee_id" in cols else "''")
+                + f" FROM hamcall_calls WHERE {_OLD_BLOB_WHERE}"
+            )
+            for callsign, raw, data_json, interest, fcc_id in (cur.fetchall() or []):
+                sets = _tidy_hamcall_row(raw, data_json, interest, fcc_id, cols)
+                cur.execute(
+                    "UPDATE hamcall_calls SET " + ", ".join(f"{k} = {ph}" for k in sets) + f" WHERE callsign = {ph}",
+                    tuple(sets.values()) + (callsign,),
+                )
+                changed += 1
+            conn.commit()
+        finally:
+            _db_close(conn)
+        return changed
+
+    conn = sqlite3.connect(_callsign_db_path_cfg(cfg), timeout=60)
     try:
-        cols = _table_columns_generic(conn, "hamcall_calls")  # empty if the table doesn't exist
-        if not {"raw", "data_json", "callsign"} <= cols:
+        cols = _table_columns_generic(conn, "hamcall_calls")
+        if "callsign" not in cols:
             return 0
-        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT callsign, raw, data_json, "
+        conn.execute("PRAGMA secure_delete = ON")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hamcall_calls_ucall ON hamcall_calls (UPPER(callsign))")
+        conn.commit()
+        if not {"raw", "data_json"} <= cols:
+            return 0
+        top = conn.execute("SELECT MAX(rowid) FROM hamcall_calls").fetchone()[0] or 0
+        select = (
+            "SELECT rowid, raw, data_json, "
             + ("interest_profile" if "interest_profile" in cols else "''") + ", "
             + ("fcc_licensee_id" if "fcc_licensee_id" in cols else "''")
-            + " FROM hamcall_calls WHERE raw LIKE '<%' OR data_json LIKE '%\"session_id\"%' OR data_json LIKE '%\"raw\"%'"
+            + f" FROM hamcall_calls WHERE rowid > ? AND rowid <= ? AND {_OLD_BLOB_WHERE}"
         )
-        rows = cur.fetchall() or []
-        for callsign, raw, data_json, interest, fcc_id in rows:
-            extras = {}
-            bio = serial = None
-            raw = raw or ""
-            if not raw.lstrip().startswith("<"):
-                try:
-                    raw = (json.loads(data_json or "{}") or {}).get("raw", "") or ""
-                except Exception:
-                    raw = ""
-            if raw.lstrip().startswith("<"):
-                try:
-                    root = ET.fromstring(raw.encode("utf-8"))
-                    extras = _qrz_extras(root)
-                    bio = _clean_lookup_value(_xml_findtext_ns_agnostic(root, "Callsign/bio", ""))
-                    serial = _clean_lookup_value(_xml_findtext_ns_agnostic(root, "Callsign/serial", ""))
-                except Exception:
-                    pass
-            sets = {"raw": "", "data_json": json.dumps(extras, ensure_ascii=False, sort_keys=True) if extras else ""}
-            if "interest_profile" in cols and bio and str(interest or "") == bio:
-                sets["interest_profile"] = ""
-            if "fcc_licensee_id" in cols and serial and str(fcc_id or "") == serial:
-                sets["fcc_licensee_id"] = ""
-            cur.execute(
-                "UPDATE hamcall_calls SET " + ", ".join(f"{k} = {ph}" for k in sets) + f" WHERE callsign = {ph}",
-                tuple(sets.values()) + (callsign,),
-            )
-            changed += 1
-        if changed:
+        start = 0
+        while start < top:
+            end = start + batch_rows
+            rows = conn.execute(select, (start, end)).fetchall()
+            for rowid, raw, data_json, interest, fcc_id in rows:
+                sets = _tidy_hamcall_row(raw, data_json, interest, fcc_id, cols)
+                conn.execute(
+                    "UPDATE hamcall_calls SET " + ", ".join(f"{k} = ?" for k in sets) + " WHERE rowid = ?",
+                    tuple(sets.values()) + (rowid,),
+                )
+                changed += 1
             conn.commit()
-            _debug_log(f"cleanup_hamcall_blobs: tidied {changed} rows")
-            if not _db_is_mysql_cfg(cfg):
-                # SQLite leaves the old text in free pages; rewrite the file so
-                # the session keys are really gone.
-                try:
-                    conn.execute("VACUUM")
-                except Exception as e:
-                    _log_exception("cleanup_hamcall_blobs VACUUM", e)
-    except Exception as e:
-        _log_exception("cleanup_hamcall_blobs", e)
+            start = end
+            time.sleep(0.01)  # let a waiting lookup in between batches
     finally:
         _db_close(conn)
+    if changed:
+        _debug_log(f"maintain_hamcall_calls: tidied {changed} rows")
     return changed
 
+
+def _hamcall_maintenance_worker(cfg: AppConfig, state: AppState) -> None:
+    if getattr(cfg, "hamcall_maintenance_done", False):
+        return
+    try:
+        n = maintain_hamcall_calls(cfg)
+    except Exception as e:
+        _log_exception("maintain_hamcall_calls", e)
+        return
+    cfg.hamcall_maintenance_done = True
+    try:
+        save_config(cfg)
+    except Exception as e:
+        _log_exception("save hamcall_maintenance_done", e)
+    if n:
+        state.status_line = f"Lookup database tidied ({n} old rows)"
+        state.dirty_status = True
 
 def _extract_qrz_callsign_payload(root: ET.Element, callsign: str, session_id: str = "", raw_xml: str = "") -> dict:
     def q(path: str, default: str = "") -> str:
@@ -4695,10 +4753,20 @@ def _upsert_hamcall_calls_from_qrz(conn, info: dict) -> None:
     if "callsign" not in insertable:
         return
 
-    ordered_cols = list(insertable.keys())
-    placeholders = ", ".join(["?"] * len(ordered_cols))
-    sql = f"INSERT OR REPLACE INTO hamcall_calls ({', '.join(ordered_cols)}) VALUES ({placeholders})"
-    conn.execute(sql, [insertable[col] for col in ordered_cols])
+    # hamcall_calls has no unique key, so INSERT OR REPLACE used to add a new
+    # row every time. Update the callsign's row(s) if present, else insert.
+    set_cols = [c for c in insertable if c.lower() != "callsign"]
+    cur = conn.execute(
+        "UPDATE hamcall_calls SET " + ", ".join(f"{c} = ?" for c in set_cols) + " WHERE UPPER(callsign) = UPPER(?)",
+        [insertable[c] for c in set_cols] + [insertable["callsign"]],
+    )
+    if cur.rowcount == 0:
+        ordered_cols = list(insertable.keys())
+        placeholders = ", ".join(["?"] * len(ordered_cols))
+        conn.execute(
+            f"INSERT INTO hamcall_calls ({', '.join(ordered_cols)}) VALUES ({placeholders})",
+            [insertable[col] for col in ordered_cols],
+        )
     conn.commit()
 
 
@@ -5653,7 +5721,7 @@ def _update_local_hamcall_calls_from_online(cfg: AppConfig, db_path: str, callsi
             _upsert_hamcall_calls_from_qrz(conn, payload)
         return
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         _upsert_hamcall_calls_from_qrz(conn, payload)
 
 def lookup_callsign_info_cfg(cfg: AppConfig, state: AppState, callsign: str) -> dict:
@@ -5708,7 +5776,7 @@ def lookup_callsign_info_cfg(cfg: AppConfig, state: AppState, callsign: str) -> 
                     with _mysql_connect_cfg(cfg) as conn:
                         _cache_online_result_in_calls(conn, merged, provider)
                 else:
-                    with sqlite3.connect(db_path) as conn:
+                    with sqlite3.connect(db_path, timeout=30) as conn:
                         _cache_online_result_in_calls(conn, merged, provider)
                 db_saved = True
             except Exception as e:
@@ -7813,9 +7881,9 @@ def main(stdscr):
         cfg = load_config()
         state.cfg = cfg
 
-    # Tidy lookup rows saved by older versions (XML blobs, session keys).
-    threading.Thread(target=cleanup_hamcall_blobs, args=(cfg,), daemon=True,
-                     name="cleanup_hamcall_blobs").start()
+    # One-time: index the lookup table and tidy rows saved by older versions.
+    threading.Thread(target=_hamcall_maintenance_worker, args=(cfg, state), daemon=True,
+                     name="hamcall_maintenance").start()
 
     # QRZ/HamQTH login can take a few seconds; don't hold up the first screen.
     threading.Thread(target=initialize_online_lookup_session, args=(cfg, state), daemon=True,
