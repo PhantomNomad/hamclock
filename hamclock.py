@@ -560,10 +560,17 @@ def ensure_station_callsign(cfg: AppConfig, callsign: str, display_name: str = "
 
         if row:
             sid = int(row[0])
-            cur.execute(
-                f"UPDATE station_callsigns SET display_name = {ph}, is_active = 1, updated_utc = {ph} WHERE id = {ph}",
-                (display_name or "", now, sid),
-            )
+            if display_name:
+                cur.execute(
+                    f"UPDATE station_callsigns SET display_name = {ph}, is_active = 1, updated_utc = {ph} WHERE id = {ph}",
+                    (display_name, now, sid),
+                )
+            else:
+                # Don't wipe an existing display name when just re-selecting the default.
+                cur.execute(
+                    f"UPDATE station_callsigns SET is_active = 1, updated_utc = {ph} WHERE id = {ph}",
+                    (now, sid),
+                )
             if make_default:
                 cur.execute(f"UPDATE station_callsigns SET is_default = 1 WHERE id = {ph}", (sid,))
             conn.commit()
@@ -575,6 +582,94 @@ def ensure_station_callsign(cfg: AppConfig, callsign: str, display_name: str = "
         )
         conn.commit()
         return int(getattr(cur, "lastrowid", 0) or 0)
+    finally:
+        _db_close(conn)
+
+
+_STATION_CALL_RE = re.compile(r"^[A-Z0-9]+(/[A-Z0-9]+)*$")
+
+
+def valid_station_callsign(value) -> str:
+    """Return the cleaned callsign if it looks like a real one, else ""."""
+    raw = re.sub(r"\s+", "", str(value or "")).upper()
+    if not (3 <= len(raw) <= 20) or not _STATION_CALL_RE.match(raw):
+        return ""
+    call = _normalize_callsign(raw)
+    if not (re.search(r"[A-Z]", call) and re.search(r"\d", call)):
+        return ""
+    return call
+
+
+def count_qsos_for_station(cfg: AppConfig, station_id: int) -> int:
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+        cur.execute(f"SELECT COUNT(*) FROM qso_log WHERE station_callsign_id = {ph}", (station_id,))
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+    finally:
+        _db_close(conn)
+
+
+def update_station_callsign(cfg: AppConfig, station_id: int, new_callsign: str, display_name: str) -> int:
+    """Rename a station callsign. QSOs logged under it follow the change.
+
+    Returns the number of QSOs whose operator callsign was updated.
+    """
+    call = valid_station_callsign(new_callsign)
+    if not call:
+        raise ValueError(f"{new_callsign!r} doesn't look like a callsign")
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+        cur.execute(f"SELECT callsign FROM station_callsigns WHERE id = {ph}", (station_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("That callsign no longer exists")
+        old_call = str(row[0] or "")
+        cur.execute(f"SELECT id FROM station_callsigns WHERE callsign = {ph} AND id <> {ph}", (call, station_id))
+        if cur.fetchone():
+            raise ValueError(f"{call} is already in the list")
+        cur.execute(
+            f"UPDATE station_callsigns SET callsign = {ph}, display_name = {ph}, updated_utc = {ph} WHERE id = {ph}",
+            (call, display_name or "", utc_now_iso(), station_id),
+        )
+        changed = 0
+        if old_call != call:
+            cur.execute(
+                f"UPDATE qso_log SET operator_callsign = {ph} WHERE station_callsign_id = {ph} AND operator_callsign = {ph}",
+                (call, station_id, old_call),
+            )
+            changed = int(getattr(cur, "rowcount", 0) or 0)
+        conn.commit()
+        return changed
+    finally:
+        _db_close(conn)
+
+
+def delete_station_callsign(cfg: AppConfig, station_id: int) -> bool:
+    """Remove a station callsign.
+
+    With no QSOs it is deleted outright (returns True). If QSOs were logged
+    under it, it's hidden from the list instead so those QSOs keep their
+    station (returns False).
+    """
+    qsos = count_qsos_for_station(cfg, station_id)
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+        if qsos:
+            cur.execute(
+                f"UPDATE station_callsigns SET is_active = 0, is_default = 0, updated_utc = {ph} WHERE id = {ph}",
+                (utc_now_iso(), station_id),
+            )
+        else:
+            cur.execute(f"DELETE FROM station_callsigns WHERE id = {ph}", (station_id,))
+        conn.commit()
+        return not qsos
     finally:
         _db_close(conn)
 
@@ -605,7 +700,7 @@ def get_station_callsigns(cfg: AppConfig) -> List[dict]:
 
 
 def select_default_station_callsign(cfg: AppConfig, state: AppState) -> None:
-    preferred = _normalize_callsign(getattr(cfg, "logbook_default_station_callsign", "") or "")
+    preferred = valid_station_callsign(getattr(cfg, "logbook_default_station_callsign", "") or "")
     if preferred:
         try:
             ensure_station_callsign(cfg, preferred, make_default=True)
@@ -1591,13 +1686,66 @@ def qso_entry_dialog(stdscr, cfg: AppConfig, state: AppState, qso_id: Optional[i
         except Exception:
             pass
 
+def _station_input_pos(stdscr):
+    maxy, maxx = stdscr.getmaxyx()
+    w = min(60, maxx - 4)
+    return max(1, maxy // 2 - 2), max(1, (maxx - w) // 2), w
+
+
+def _pick_station_callsign(stdscr, calls: List[dict], title: str) -> Optional[dict]:
+    if not calls:
+        _simple_message_popup(stdscr, "Callsign", "No station callsigns yet.")
+        return None
+    labels = [
+        f"{c['callsign']}{'  - ' + c['display_name'] if c.get('display_name') else ''}{' [default]' if c['is_default'] else ''}"
+        for c in calls
+    ]
+    idx = _popup_menu(stdscr, title, labels)
+    return calls[idx] if 0 <= idx < len(calls) else None
+
+
+def _ask_station_callsign(stdscr, prompt: str, initial: str = "") -> Optional[str]:
+    """Prompt until a valid callsign is entered. None if Esc."""
+    y0, x0, w = _station_input_pos(stdscr)
+    text = initial
+    while True:
+        text = _input_box(stdscr, y0, x0, w, prompt, text)
+        if text is None:
+            return None
+        call = valid_station_callsign(text)
+        if call:
+            return call
+        _simple_message_popup(stdscr, "Callsign",
+                              f"'{text.strip()}' isn't a valid callsign.\nUse letters, numbers and / only, e.g. VE6CPU or VE6CPU/P.")
+
+
+def _after_station_change(cfg: AppConfig, state: AppState) -> None:
+    """Re-pick the active callsign and persist the default so the settings file
+    never points at a callsign that was edited or removed."""
+    select_default_station_callsign(cfg, state)
+    calls = get_station_callsigns(cfg)
+    default = next((c for c in calls if c["is_default"]), None)
+    cfg.logbook_default_station_callsign = default["callsign"] if default else ""
+    try:
+        save_config(cfg)
+    except Exception as e:
+        _log_exception("save default station callsign", e)
+    _refresh_logbook_view(cfg, state)
+
+
 def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
     while True:
         calls = get_station_callsigns(cfg)
-        items = [f"Use: {c['callsign']}{' [default]' if c['is_default'] else ''}" for c in calls]
-        items += ["Add new callsign", "Set selected callsign as default", "Cancel"]
+        items = [
+            f"Use: {c['callsign']}{' [default]' if c['is_default'] else ''}"
+            + (" <" if c["id"] == state.selected_station_callsign_id else "")
+            for c in calls
+        ]
+        actions = ["Add new callsign", "Edit a callsign", "Delete a callsign",
+                   "Set selected callsign as default", "Cancel"]
+        items += actions
         idx = _popup_menu(stdscr, "Station Callsigns", items)
-        if idx < 0 or idx == len(items) - 1:
+        if idx < 0:
             return False
         if idx < len(calls):
             chosen = calls[idx]
@@ -1608,29 +1756,32 @@ def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
             state.status_line = f"Logging for {chosen['callsign']}"
             state.dirty_status = True
             return True
-        if idx == len(calls):
-            maxy, maxx = stdscr.getmaxyx()
-            w = min(60, maxx - 4)
-            y0 = max(1, maxy // 2 - 2)
-            x0 = max(1, (maxx - w) // 2)
-            call = _input_box(stdscr, y0, x0, w, "New Callsign: ", "")
-            if not call:
+
+        action = actions[idx - len(calls)]
+        if action == "Cancel":
+            return False
+
+        if action == "Add new callsign":
+            call = _ask_station_callsign(stdscr, "New Callsign: ")
+            if call is None:
                 continue
+            y0, x0, w = _station_input_pos(stdscr)
             display = _input_box(stdscr, y0 + 3, x0, w, "Display Name: ", "")
-            make_default = _confirm_dialog(stdscr, "Default Callsign", f"Make {_normalize_callsign(call)} the default callsign?")
+            if display is None:
+                continue
+            make_default = _confirm_dialog(stdscr, "Default Callsign", f"Make {call} the default callsign?")
             try:
-                sid = ensure_station_callsign(cfg, call, display_name=display, make_default=make_default)
-                select_default_station_callsign(cfg, state)
+                sid = ensure_station_callsign(cfg, call, display_name=display.strip(), make_default=make_default)
+                if make_default:
+                    _after_station_change(cfg, state)
                 if sid:
-                    calls2 = get_station_callsigns(cfg)
-                    for c in calls2:
+                    for c in get_station_callsigns(cfg):
                         if c["id"] == sid:
                             state.selected_station_callsign_id = c["id"]
                             state.selected_station_callsign = c["callsign"]
-                            cfg.logbook_default_station_callsign = c["callsign"]
                             break
                 _refresh_logbook_view(cfg, state)
-                state.status_line = f"Added callsign {state.selected_station_callsign or _normalize_callsign(call)}"
+                state.status_line = f"Added callsign {call}"
                 state.dirty_status = True
                 return True
             except Exception as e:
@@ -1638,14 +1789,71 @@ def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
                 state.status_line = f"Callsign add failed: {e}"
                 state.dirty_status = True
                 continue
-        if idx == len(calls) + 1:
+
+        if action == "Edit a callsign":
+            target = _pick_station_callsign(stdscr, calls, "Edit which callsign?")
+            if target is None:
+                continue
+            call = _ask_station_callsign(stdscr, "Callsign: ", target["callsign"])
+            if call is None:
+                continue
+            y0, x0, w = _station_input_pos(stdscr)
+            display = _input_box(stdscr, y0 + 3, x0, w, "Display Name: ", target.get("display_name", ""))
+            if display is None:
+                continue
+            try:
+                moved = update_station_callsign(cfg, target["id"], call, display.strip())
+                current_default = valid_station_callsign(cfg.logbook_default_station_callsign)
+                if current_default in ("", target["callsign"]):
+                    # Otherwise the old name would be re-added as the default.
+                    cfg.logbook_default_station_callsign = call if target["is_default"] or current_default else ""
+                if state.selected_station_callsign_id == target["id"]:
+                    state.selected_station_callsign = call
+                _after_station_change(cfg, state)
+                msg = f"Changed {target['callsign']} to {call}"
+                if moved:
+                    msg += f" ({moved} QSO{'s' if moved != 1 else ''} updated)"
+                state.status_line = msg
+                state.dirty_status = True
+            except Exception as e:
+                _simple_message_popup(stdscr, "Callsign", f"Unable to change callsign:\n{e}")
+            continue
+
+        if action == "Delete a callsign":
+            target = _pick_station_callsign(stdscr, calls, "Delete which callsign?")
+            if target is None:
+                continue
+            try:
+                qsos = count_qsos_for_station(cfg, target["id"])
+                if qsos:
+                    question = (f"{target['callsign']} has {qsos} QSO{'s' if qsos != 1 else ''} logged.\n"
+                                "Remove it from this list? The QSOs are kept.")
+                else:
+                    question = f"Delete {target['callsign']}?"
+                if not _confirm_dialog(stdscr, "Delete Callsign", question):
+                    continue
+                delete_station_callsign(cfg, target["id"])
+                if state.selected_station_callsign_id == target["id"]:
+                    state.selected_station_callsign_id = None
+                    state.selected_station_callsign = ""
+                if valid_station_callsign(cfg.logbook_default_station_callsign) == target["callsign"] \
+                        or not valid_station_callsign(cfg.logbook_default_station_callsign):
+                    cfg.logbook_default_station_callsign = ""
+                _after_station_change(cfg, state)
+                state.status_line = f"Removed {target['callsign']}"
+                state.dirty_status = True
+            except Exception as e:
+                _simple_message_popup(stdscr, "Callsign", f"Unable to delete callsign:\n{e}")
+            continue
+
+        if action == "Set selected callsign as default":
             if not state.selected_station_callsign_id:
                 _simple_message_popup(stdscr, "Callsign", "No callsign is currently selected.")
                 continue
             try:
                 set_default_station_callsign(cfg, state.selected_station_callsign_id)
                 cfg.logbook_default_station_callsign = state.selected_station_callsign
-                _refresh_logbook_view(cfg, state)
+                _after_station_change(cfg, state)
                 state.status_line = f"Default callsign set to {state.selected_station_callsign}"
                 state.dirty_status = True
                 return True
@@ -1731,22 +1939,96 @@ def _test_database_connection_cfg(cfg: AppConfig):
     return _test_sqlite_connection_cfg(cfg)
 
 
-def _input_box(stdscr, y0, x0, w, prompt, initial=""):
+def _read_line(win, y: int, x: int, width: int, initial: str = "", mask: bool = False) -> Optional[str]:
+    """Edit one line of text in place.
+
+    The existing value is pre-filled and editable. Enter returns the text,
+    Esc returns None (cancel). Left/Right/Home/End move, Backspace/Delete
+    remove, Ctrl-U clears the line. Replaces curses getstr(), which can't
+    cancel (it typed Esc in as ^[) and started from an empty buffer.
+    """
+    width = max(1, int(width))
+    buf = list(str(initial or ""))
+    pos = len(buf)
+    try:
+        old_cursor = curses.curs_set(1)
+    except Exception:
+        old_cursor = None
+    try:
+        curses.noecho()
+    except Exception:
+        pass
+    win.keypad(True)
+    win.timeout(-1)
+    try:
+        while True:
+            start = max(0, pos - width + 1)
+            text = "".join(buf)
+            shown = ("*" * len(text)) if mask else text
+            safe_addstr(win, y, x, shown[start:start + width].ljust(width))
+            try:
+                win.move(y, x + (pos - start))
+            except Exception:
+                pass
+            win.refresh()
+            k = win.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            if k == 27:
+                tail = read_escape_tail(win)
+                win.timeout(-1)
+                if not tail:
+                    return None
+                if tail in ("[D", "OD"):
+                    pos = max(0, pos - 1)
+                elif tail in ("[C", "OC"):
+                    pos = min(len(buf), pos + 1)
+                continue
+            if k in (10, 13, curses.KEY_ENTER):
+                return "".join(buf)
+            if k in (curses.KEY_BACKSPACE, 127, 8):
+                if pos > 0:
+                    del buf[pos - 1]
+                    pos -= 1
+            elif k == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+            elif k == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif k == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif k in (curses.KEY_HOME, 1):   # Home / Ctrl-A
+                pos = 0
+            elif k in (curses.KEY_END, 5):    # End / Ctrl-E
+                pos = len(buf)
+            elif k == 21:                     # Ctrl-U
+                buf = []
+                pos = 0
+            elif 32 <= k <= 126:
+                buf.insert(pos, chr(k))
+                pos += 1
+    finally:
+        if old_cursor is not None:
+            try:
+                curses.curs_set(old_cursor)
+            except Exception:
+                pass
+
+
+def _input_box(stdscr, y0, x0, w, prompt, initial="", mask: Optional[bool] = None):
+    """Small boxed prompt. Returns the text, or None if Esc was pressed."""
+    if mask is None:
+        mask = "password" in str(prompt).lower()
+    maxy, maxx = stdscr.getmaxyx()
+    w = max(10, min(w, maxx - x0))
+    y0 = max(0, min(y0, maxy - 3))
     win = curses.newwin(3, w, y0, x0)
     win.erase()
     win.box()
     safe_addstr(win, 1, 2, prompt[: max(1, w - 4)])
-    if initial:
-        safe_addstr(win, 1, min(w - 3, 2 + len(prompt)), str(initial)[: max(0, w - (4 + len(prompt)))])
-    win.refresh()
-    curses.echo()
-    try:
-        raw = win.getstr(1, 2 + len(prompt), max(1, w - (4 + len(prompt))))
-        return raw.decode("utf-8", errors="ignore") if raw is not None else ""
-    except Exception:
-        return initial
-    finally:
-        curses.noecho()
+    safe_addstr(win, 2, max(1, w - 22), " Enter=OK Esc=Cancel "[: max(0, w - 2)], curses.A_DIM)
+    field_x = min(w - 3, 2 + len(prompt))
+    return _read_line(win, 1, field_x, max(1, w - field_x - 2), str(initial or ""), mask=mask)
 
 
 
@@ -6270,6 +6552,13 @@ def show_help_screen(stdscr, state: AppState):
         "  D = Delete selected QSO",
         "  Up/Down = Select recent QSO",
         "",
+        "Station callsigns (C in Logbook mode)",
+        "  Use / Add / Edit / Delete / Set default",
+        "",
+        "Text boxes",
+        "  Enter = OK   Esc = Cancel",
+        "  Left/Right/Home/End = Move   Ctrl-U = Clear",
+        "",
         "File menu",
         "  Up/Down = Move through menu items",
         "  Enter = Open selected item",
@@ -6479,15 +6768,10 @@ def edit_mysql_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
             shown = "*" * len(str(inp)) if attr == "mysql_password" and inp else str(inp)
             safe_addstr(win2, 1, min(w - 3, 2 + len(prompt)), shown[: max(0, w - (4 + len(prompt)))])
             win2.refresh()
-            curses.echo()
-            try:
-                s = win2.getstr(1, 2 + len(prompt), max(1, w - (4 + len(prompt)))).decode("utf-8", errors="ignore")
-                if s is not None:
-                    values[attr] = s
-            except Exception:
-                pass
-            finally:
-                curses.noecho()
+            s = _read_line(win2, 1, 2 + len(prompt), max(1, w - (4 + len(prompt))), str(inp),
+                           mask=(attr == "mysql_password"))
+            if s is not None:
+                values[attr] = s
 
     curses.curs_set(0)
     stdscr.timeout(100)
@@ -6702,15 +6986,10 @@ def edit_online_lookup_dialog(stdscr, cfg: AppConfig, state: AppState):
             win2.box()
             safe_addstr(win2, 1, 2, prompt)
             win2.refresh()
-            curses.echo()
-            try:
-                s = win2.getstr(1, 2 + len(prompt), w - (4 + len(prompt))).decode("utf-8", errors="ignore")
-                if s is not None:
-                    values[attr] = s
-            except Exception:
-                pass
-            finally:
-                curses.noecho()
+            s = _read_line(win2, 1, 2 + len(prompt), max(1, w - (4 + len(prompt))),
+                           str(values.get(attr, "") or ""), mask=("password" in attr))
+            if s is not None:
+                values[attr] = s
 
 
 
@@ -6733,21 +7012,11 @@ def callsign_lookup_dialog(stdscr, cfg: AppConfig, state: AppState):
     safe_addstr(win, 2, 2, prompt)
     win.refresh()
 
-    curses.curs_set(1)
     stdscr.nodelay(False)
-    curses.echo()
-    entered = ""
-    try:
-        raw = win.getstr(2, 2 + len(prompt), max(1, w - (4 + len(prompt))))
-        if raw is None:
-            return
-        entered = raw.decode("utf-8", errors="ignore").strip()
-    except Exception:
-        entered = ""
-    finally:
-        curses.noecho()
-        curses.curs_set(0)
-        stdscr.timeout(100)
+    raw = _read_line(win, 2, 2 + len(prompt), max(1, w - (4 + len(prompt))))
+    curses.curs_set(0)
+    stdscr.timeout(100)
+    entered = (raw or "").strip()   # Esc (None) behaves like an empty entry
 
     try:
         win.erase()
@@ -6847,11 +7116,8 @@ def dx_command_dialog(stdscr, state: AppState):
     safe_addstr(win, 3, 2, "Enter=Send   ESC=Cancel")
     win.refresh()
 
-    curses.curs_set(1)
-    curses.echo()
     try:
-        # Read input
-        s = win.getstr(2, 2 + len(prompt), w - (4 + len(prompt))).decode("utf-8", errors="ignore")
+        s = _read_line(win, 2, 2 + len(prompt), max(1, w - (4 + len(prompt))))
         if s is None:
             return
         cmd = s.strip()
@@ -6859,11 +7125,7 @@ def dx_command_dialog(stdscr, state: AppState):
             state.dx_cmd_queue.put(cmd)
             state.status_line = f"DX cmd queued: {cmd}"
             state.dirty_status = True
-    except Exception:
-        # ignore
-        pass
     finally:
-        curses.noecho()
         curses.curs_set(0)
         stdscr.timeout(100)
 

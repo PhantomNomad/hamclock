@@ -64,3 +64,7 @@ November 24/2026 changes (bug fixes and cleanup)
 - "? or F1 = Help  Esc = Menu" hint on the map panel border.  ? opens help too, and F1 now works from PuTTY's default keyboard setting.
 - When rig control is off the Radio box is hidden and the DE / DX panel uses its space.  The DE / DX panel switches to a compact layout when it's short on room, so both DE and DX fit on a 24-line terminal.
 - Esc in the Rig Control dialog now cancels changes instead of keeping them.
+- Station Callsigns menu (C in Logbook mode) has Edit and Delete.  Editing a callsign also updates the QSOs logged under it.  Deleting one with QSOs hides it from the list and keeps the QSOs.
+- New callsigns must look like a callsign (letters, numbers and /).
+- Text boxes: Esc cancels instead of typing ^[, and the current value is filled in so you can edit it.  Pressing Enter on a setting no longer blanks it.
+- Re-selecting the default callsign no longer wipes its display name.
