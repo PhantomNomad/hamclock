@@ -4271,8 +4271,8 @@ def _mysql_upsert_hamcall_calls_from_qrz(conn, info: dict) -> None:
         "dxcc_number": _clean_lookup_value(info.get("dxcc_number")),
         "dxcc_name": _clean_lookup_value(info.get("dxcc_name") or info.get("country")),
         "last_lookup_utc": _clean_lookup_value(info.get("last_lookup_utc") or _utc_now_iso()),
-        "raw": _clean_lookup_value(info.get("raw")),
-        "data_json": _clean_lookup_value(info.get("data_json") or json.dumps(info, ensure_ascii=False, sort_keys=True)),
+        "raw": _hamcall_raw_value(info),
+        "data_json": _hamcall_extras_json(info, cols),
     }
 
     insertable = {k: row.get(k, "") for k in row if k.lower() in cols}
@@ -4426,6 +4426,120 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# QRZ fields worth keeping that have no hamcall_calls column of their own.
+# Stored as a small JSON object in data_json instead of the whole XML reply.
+_QRZ_EXTRA_FIELDS = ("nickname", "name_fmt", "cqzone", "ituzone", "lotw", "eqsl", "mqsl", "aliases")
+
+# Never written to the database: the whole provider reply and the login session.
+_HAMCALL_NEVER_STORE = {"raw", "session_id", "data_json", "_raw", "xml"}
+
+
+def _qrz_extras(root: ET.Element) -> dict:
+    out = {}
+    for name in _QRZ_EXTRA_FIELDS:
+        value = _clean_lookup_value(_xml_findtext_ns_agnostic(root, f"Callsign/{name}", ""))
+        if value:
+            out[name] = value
+    return out
+
+
+def _hamcall_raw_value(info: dict) -> str:
+    """Keep 'raw' only for the short source records the database shipped with,
+    never a provider's XML/JSON reply."""
+    raw = _clean_lookup_value(info.get("raw"))
+    if raw.lstrip().startswith(("<", "{", "[")):
+        return ""
+    return raw
+
+
+def _hamcall_extras_json(info: dict, columns) -> str:
+    """data_json for a row: only fields that don't already have a column."""
+    existing = info.get("data_json")
+    if isinstance(existing, str) and existing.strip():
+        try:
+            parsed = json.loads(existing)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and not (_HAMCALL_NEVER_STORE & set(parsed)):
+            return existing
+    cols = {c.lower() for c in (columns or ())}
+    extras = {
+        k: v for k, v in (info or {}).items()
+        if k not in _HAMCALL_NEVER_STORE and k.lower() not in cols
+        and k not in ("name", "prov_state", "country", "source")
+        and isinstance(v, (str, int, float)) and str(v).strip()
+    }
+    return json.dumps(extras, ensure_ascii=False, sort_keys=True) if extras else ""
+
+
+def cleanup_hamcall_blobs(cfg: AppConfig) -> int:
+    """One-time tidy of hamcall_calls rows saved by older versions.
+
+    Those rows held the whole QRZ/HamQTH XML reply (with the login session
+    key) in raw and again inside data_json, and put QRZ's <serial>/<bio> in
+    fcc_licensee_id/interest_profile. Strip that, keeping a small JSON of the
+    useful QRZ extras. Rows that came with the database are left alone.
+    Returns the number of rows changed.
+    """
+    conn = _db_connect_cfg(cfg)
+    changed = 0
+    try:
+        cols = _table_columns_generic(conn, "hamcall_calls")  # empty if the table doesn't exist
+        if not {"raw", "data_json", "callsign"} <= cols:
+            return 0
+        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT callsign, raw, data_json, "
+            + ("interest_profile" if "interest_profile" in cols else "''") + ", "
+            + ("fcc_licensee_id" if "fcc_licensee_id" in cols else "''")
+            + " FROM hamcall_calls WHERE raw LIKE '<%' OR data_json LIKE '%\"session_id\"%' OR data_json LIKE '%\"raw\"%'"
+        )
+        rows = cur.fetchall() or []
+        for callsign, raw, data_json, interest, fcc_id in rows:
+            extras = {}
+            bio = serial = None
+            raw = raw or ""
+            if not raw.lstrip().startswith("<"):
+                try:
+                    raw = (json.loads(data_json or "{}") or {}).get("raw", "") or ""
+                except Exception:
+                    raw = ""
+            if raw.lstrip().startswith("<"):
+                try:
+                    root = ET.fromstring(raw.encode("utf-8"))
+                    extras = _qrz_extras(root)
+                    bio = _clean_lookup_value(_xml_findtext_ns_agnostic(root, "Callsign/bio", ""))
+                    serial = _clean_lookup_value(_xml_findtext_ns_agnostic(root, "Callsign/serial", ""))
+                except Exception:
+                    pass
+            sets = {"raw": "", "data_json": json.dumps(extras, ensure_ascii=False, sort_keys=True) if extras else ""}
+            if "interest_profile" in cols and bio and str(interest or "") == bio:
+                sets["interest_profile"] = ""
+            if "fcc_licensee_id" in cols and serial and str(fcc_id or "") == serial:
+                sets["fcc_licensee_id"] = ""
+            cur.execute(
+                "UPDATE hamcall_calls SET " + ", ".join(f"{k} = {ph}" for k in sets) + f" WHERE callsign = {ph}",
+                tuple(sets.values()) + (callsign,),
+            )
+            changed += 1
+        if changed:
+            conn.commit()
+            _debug_log(f"cleanup_hamcall_blobs: tidied {changed} rows")
+            if not _db_is_mysql_cfg(cfg):
+                # SQLite leaves the old text in free pages; rewrite the file so
+                # the session keys are really gone.
+                try:
+                    conn.execute("VACUUM")
+                except Exception as e:
+                    _log_exception("cleanup_hamcall_blobs VACUUM", e)
+    except Exception as e:
+        _log_exception("cleanup_hamcall_blobs", e)
+    finally:
+        _db_close(conn)
+    return changed
+
+
 def _extract_qrz_callsign_payload(root: ET.Element, callsign: str, session_id: str = "", raw_xml: str = "") -> dict:
     def q(path: str, default: str = "") -> str:
         return _clean_lookup_value(_xml_findtext_ns_agnostic(root, path, default))
@@ -4476,9 +4590,9 @@ def _extract_qrz_callsign_payload(root: ET.Element, callsign: str, session_id: s
         "url": q("Callsign/url"),
         "vanity_flag": q("Callsign/vanity"),
         "fax": q("Callsign/fax"),
-        "interest_profile": q("Callsign/bio"),
+        "interest_profile": "",   # QRZ <bio> is the size of the bio page, not an interest profile
         "phone": q("Callsign/phone"),
-        "fcc_licensee_id": q("Callsign/serial"),
+        "fcc_licensee_id": "",    # QRZ <serial> is QRZ's own record number, not an FCC ID
         "ten_ten_number": "",
         "fcc_frn": q("Callsign/frn"),
         "iota": q("Callsign/iota"),
@@ -4491,16 +4605,13 @@ def _extract_qrz_callsign_payload(root: ET.Element, callsign: str, session_id: s
         "dxcc_number": q("Callsign/dxcc"),
         "dxcc_name": country,
         "last_lookup_utc": _utc_now_iso(),
-        "raw": raw_xml or "",
-        "data_json": "",
+        "raw": "",
+        "data_json": json.dumps(_qrz_extras(root), ensure_ascii=False, sort_keys=True) if _qrz_extras(root) else "",
         # convenience fields for current UI/cache logic
         "name": display_name,
         "prov_state": state,
         "country": country,
-        "session_id": _clean_lookup_value(session_id),
     }
-    if not data["data_json"]:
-        data["data_json"] = json.dumps(data, ensure_ascii=False, sort_keys=True)
     return data
 
 
@@ -4568,8 +4679,8 @@ def _upsert_hamcall_calls_from_qrz(conn, info: dict) -> None:
         "dxcc_number": _clean_lookup_value(info.get("dxcc_number")),
         "dxcc_name": _clean_lookup_value(info.get("dxcc_name") or info.get("country")),
         "last_lookup_utc": _clean_lookup_value(info.get("last_lookup_utc")) or _utc_now_iso(),
-        "raw": _clean_lookup_value(info.get("raw")),
-        "data_json": _clean_lookup_value(info.get("data_json")),
+        "raw": _hamcall_raw_value(info),
+        "data_json": "",
     }
 
     if not row["first_name"] and not row["last_name"]:
@@ -4578,8 +4689,7 @@ def _upsert_hamcall_calls_from_qrz(conn, info: dict) -> None:
         row["middle"] = row["middle"] or middle
         row["last_name"] = row["last_name"] or last_name
 
-    if not row["data_json"]:
-        row["data_json"] = json.dumps(info, ensure_ascii=False, sort_keys=True)
+    row["data_json"] = _hamcall_extras_json(info, cols)
 
     insertable = {k: row.get(k, "") for k in row if k.lower() in cols}
     if "callsign" not in insertable:
@@ -7702,6 +7812,10 @@ def main(stdscr):
         # Reload from disk to ensure type conversions are applied consistently.
         cfg = load_config()
         state.cfg = cfg
+
+    # Tidy lookup rows saved by older versions (XML blobs, session keys).
+    threading.Thread(target=cleanup_hamcall_blobs, args=(cfg,), daemon=True,
+                     name="cleanup_hamcall_blobs").start()
 
     # QRZ/HamQTH login can take a few seconds; don't hold up the first screen.
     threading.Thread(target=initialize_online_lookup_session, args=(cfg, state), daemon=True,
