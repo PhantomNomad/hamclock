@@ -202,7 +202,7 @@ class AppState:
     dx_points_file: str = ""
     lookup_provider_display: str = "hamdb.org"
     lookup_session_id_display: str = "-"
-    online_lookup_status_line: str = "Lookup: hamdb.org sid=-"
+    online_lookup_status_line: str = "Lookup: hamdb.org"
     online_lookup_history: List[str] = field(default_factory=list)
     online_lookup_lock: "threading.Lock" = field(default_factory=threading.Lock)
     dirty_wx_static: bool = True
@@ -4868,15 +4868,35 @@ def _push_online_lookup_status(state: AppState, provider: str, session_id: str, 
     provider = _clean_lookup_value(provider) or "-"
     sid = _clean_lookup_value(session_id) or "-"
     cs = _normalize_callsign(callsign)
-    item = f"{provider} {sid} {cs}".strip()
+    item = f"{provider} {cs}".strip()
     with state.online_lookup_lock:
         state.lookup_provider_display = provider
         state.lookup_session_id_display = sid
         state.online_lookup_history.insert(0, item)
         state.online_lookup_history = state.online_lookup_history[:4]
-        state.online_lookup_status_line = f"Lookup: {provider} sid={sid}"
+        state.online_lookup_status_line = f"Lookup: {provider}"
         if cs:
             state.online_lookup_status_line += f" call={cs}"
+    state.dirty_status = True
+
+
+def _mark_lookup_db_result(state: AppState, callsign: str, outcome: str) -> None:
+    """Append what happened to the online result to the status bar Lookup line.
+
+    outcome: "saved", "not found", or an error message.
+    """
+    cs = _normalize_callsign(callsign)
+    if outcome == "saved":
+        suffix = " -> to Local DB"
+    elif outcome == "not found":
+        suffix = " -> not found"
+    else:
+        suffix = f" -> DB save failed: {outcome}"
+    with state.online_lookup_lock:
+        line = state.online_lookup_status_line
+        # only annotate the line for this callsign (another lookup may have replaced it)
+        if cs and line.endswith(f"call={cs}"):
+            state.online_lookup_status_line = line + suffix
     state.dirty_status = True
 
 
@@ -4903,9 +4923,9 @@ def _set_lookup_provider_session_display(state: AppState, provider: str, session
     with state.online_lookup_lock:
         state.lookup_provider_display = provider_clean
         state.lookup_session_id_display = sid
-        state.online_lookup_status_line = f"Lookup: {provider_clean} sid={sid}"
-        if source and source != "-":
-            state.online_lookup_status_line += f" src={source}"
+        state.online_lookup_status_line = f"Lookup: {provider_clean}"
+        if sid == "error":
+            state.online_lookup_status_line += " (login failed)"
     state.dirty_status = True
 
 
@@ -5564,6 +5584,8 @@ def lookup_callsign_info_cfg(cfg: AppConfig, state: AppState, callsign: str) -> 
         if result:
             _debug_log(f"lookup source=online provider={provider!r} callsign={callsign!r}")
             merged_result = _merge_lookup_result(local_result, result, provider, callsign)
+            db_saved = False
+            db_error = ""
 
             try:
                 merged = dict(raw or {})
@@ -5578,7 +5600,9 @@ def lookup_callsign_info_cfg(cfg: AppConfig, state: AppState, callsign: str) -> 
                 else:
                     with sqlite3.connect(db_path) as conn:
                         _cache_online_result_in_calls(conn, merged, provider)
+                db_saved = True
             except Exception as e:
+                db_error = db_error or str(e)
                 _debug_log(f"lookup cache write failed provider={provider!r} callsign={callsign!r} db={db_path!r}: {e}")
 
             online_filled_missing = missing_fields & (
@@ -5597,12 +5621,19 @@ def lookup_callsign_info_cfg(cfg: AppConfig, state: AppState, callsign: str) -> 
             if online_filled_missing:
                 try:
                     _update_local_hamcall_calls_from_online(cfg, db_path, callsign, local_hamcall_row, raw, result, provider)
+                    db_saved = True
                 except Exception as e:
+                    db_error = db_error or str(e)
                     _debug_log(f"lookup hamcall update failed provider={provider!r} callsign={callsign!r} db={db_path!r}: {e}")
 
+            if db_error:
+                _mark_lookup_db_result(state, callsign, db_error)
+            elif db_saved:
+                _mark_lookup_db_result(state, callsign, "saved")
             return merged_result
 
         _debug_log(f"lookup source=not_found provider={provider!r} callsign={callsign!r}")
+        _mark_lookup_db_result(state, callsign, "not found")
     except Exception as e:
         _debug_log(f"lookup error source=online provider={provider!r} callsign={callsign!r}: {e}")
         state.status_line = f"Lookup error ({provider}): {e}"
