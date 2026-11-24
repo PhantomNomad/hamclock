@@ -1,34 +1,4 @@
-
 import curses
-
-
-def _dedx_field(v):
-    if v is None:
-        return ""
-    v = str(v).strip()
-    return v
-
-def _dedx_info_line(label, info):
-    if not info:
-        return f"{label}:"
-    call = _dedx_field(info.get("callsign") or info.get("call"))
-    name = _dedx_field(info.get("name"))
-    city = _dedx_field(info.get("city"))
-    prov = _dedx_field(info.get("prov") or info.get("state") or info.get("province"))
-    country = _dedx_field(info.get("country"))
-    source = _dedx_field(info.get("source") or info.get("database"))
-
-    parts = [p for p in [call, name, city, prov, country] if p]
-    line1 = f"{label}: " + " | ".join(parts) if parts else f"{label}:"
-    line2 = f"Src: {source}" if source else "Src:"
-    return line1 + "\n" + line2
-
-def format_dedx_static_panel(de_info, dx_info):
-    # Fixed non-scrolling layout:
-    # DE info (2 lines), one blank line, DX info (2 lines)
-    de_block = _dedx_info_line("DE", de_info)
-    dx_block = _dedx_info_line("DX", dx_info)
-    return de_block + "\n\n" + dx_block
 import os
 import io
 import contextlib
@@ -62,7 +32,29 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+def _load_sibling_module(name: str):
+    """Import name.py from this file's folder, however Python was started."""
+    import importlib.util as _ilu
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
+    if not os.path.exists(path):
+        return None
+    try:
+        spec = _ilu.spec_from_file_location(name, path)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        sys.modules.pop(name, None)
+        return None
+
+
+adif = _load_sibling_module("adif")  # ADIF reader/writer; None if adif.py is missing
 from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9
+    ZoneInfo = None
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -119,21 +111,16 @@ def _log_exception(context: str, exc: Exception) -> None:
 
 @dataclass
 class AppConfig:
-    dx_host: str = ""
-    dx_port: int = 7300
-    dx_user: str = ""
-    dx_pass: str = ""
 
     dx_filter: str = ""
 
     wx_location_name: str = ""
-    map_image_path: str = "world_map.jpg"
 
     refresh_seconds: float = 1800.0
     map_refresh_seconds: float = 300.0  # 5 minutes
 
     time_refresh_seconds: float = 1.0
-    enable_logging: bool = True
+    enable_logging: bool = False
 
     online_lookup_website: str = "hamdb.org"
     online_lookup_username: str = ""
@@ -192,6 +179,7 @@ class AppState:
     wx_static_lines: List[str] = field(default_factory=list)   # non-time lines
     wx_time_lines: List[str] = field(default_factory=list)     # local/utc only
     dedx_lines: List[str] = field(default_factory=list)
+    dedx_spot_info: Optional[Tuple[dict, dict]] = None
     dedx_lookup_cache: dict = field(default_factory=dict)
     dedx_lookup_lock: "threading.Lock" = field(default_factory=threading.Lock)
 
@@ -230,12 +218,15 @@ class AppState:
     logbook_recent_rows: List[dict] = field(default_factory=list)
     rig_frequency: str = "-"
     rig_mode: str = "-"
-    rig_comp: bool = False
-    rig_preamp: str = "Off"
+    # None = not reported by the radio / not supported by rigctld
+    rig_comp: Optional[bool] = None
+    rig_preamp: str = "-"
     rig_agc: str = "-"
-    rig_nb: bool = False
-    rig_nr: bool = False
+    rig_nb: Optional[bool] = None
+    rig_nr: Optional[bool] = None
+    rig_unsupported: set = field(default_factory=set)
     rig_status_line: str = "Radio: disabled"
+    layout_rig_enabled: bool = False
     dirty_rig: bool = True
     shortwave_mode: bool = False
     shortwave_rows: List[dict] = field(default_factory=list)
@@ -243,6 +234,10 @@ class AppState:
     shortwave_last_refresh_key: str = ""
     cfg: Optional[AppConfig] = None
     shortwave_languages: str = ""
+    # background workers
+    data_refresh_event: "threading.Event" = field(default_factory=threading.Event)
+    space_inner_w: int = 0
+    dedx_spot_queue: "queue.Queue[str]" = field(default_factory=queue.Queue)
 
 
 
@@ -299,21 +294,34 @@ def load_config(path: str = CONFIG_FILE) -> AppConfig:
         if new_key not in data and old_key in data:
             data[new_key] = data.get(old_key)
 
+    # Older settings files kept the DX cluster login twice (dx_host and
+    # dx_cluster_host, etc.). dx_cluster_* is now the only set. The old
+    # dx_* values are what the cluster connection actually used, so they win.
+    dx_legacy_map = {
+        "dx_host": "dx_cluster_host",
+        "dx_port": "dx_cluster_port",
+        "dx_user": "dx_cluster_username",
+        "dx_pass": "dx_cluster_password",
+    }
+    for old_key, new_key in dx_legacy_map.items():
+        if data.get(old_key):
+            data[new_key] = data.get(old_key)
+
     # Only accept known fields (avoid crashing on extra keys)
     for k in getattr(cfg, "__dataclass_fields__", {}).keys():
         if k in data:
             try:
                 setattr(cfg, k, data[k])
-            except Exception:
-                pass
+            except Exception as e:
+                _log_exception("load_config: bad value for setting", e)
 
     normalize_config(cfg)
-    set_logging_enabled(getattr(cfg, "enable_logging", True))
+    set_logging_enabled(getattr(cfg, "enable_logging", False))
     return cfg
 
 def save_config(cfg: AppConfig, path: str = CONFIG_FILE) -> None:
     normalize_config(cfg)
-    set_logging_enabled(getattr(cfg, "enable_logging", True))
+    set_logging_enabled(getattr(cfg, "enable_logging", False))
     data = {k: getattr(cfg, k) for k in cfg.__dataclass_fields__.keys()}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -336,24 +344,9 @@ def _coerce_bool(value, default: bool = False) -> bool:
 def normalize_config(cfg: AppConfig) -> AppConfig:
     """Normalize menu-facing settings into the runtime fields still used elsewhere."""
     try:
-        if not getattr(cfg, "dx_host", ""):
-            cfg.dx_host = getattr(cfg, "dx_cluster_host", "") or getattr(cfg, "dx_host", "")
-        if not getattr(cfg, "dx_user", ""):
-            cfg.dx_user = getattr(cfg, "dx_cluster_username", "") or getattr(cfg, "dx_user", "")
-        if not getattr(cfg, "dx_pass", ""):
-            cfg.dx_pass = getattr(cfg, "dx_cluster_password", "") or getattr(cfg, "dx_pass", "")
-        if not getattr(cfg, "dx_port", None):
-            cfg.dx_port = int(getattr(cfg, "dx_cluster_port", 7300) or 7300)
+        cfg.dx_cluster_port = int(getattr(cfg, "dx_cluster_port", 0) or 7300)
     except Exception:
-        pass
-
-    try:
-        cfg.dx_cluster_host = getattr(cfg, "dx_cluster_host", "") or getattr(cfg, "dx_host", "")
-        cfg.dx_cluster_port = int(getattr(cfg, "dx_cluster_port", 0) or getattr(cfg, "dx_port", 7300) or 7300)
-        cfg.dx_cluster_username = getattr(cfg, "dx_cluster_username", "") or getattr(cfg, "dx_user", "")
-        cfg.dx_cluster_password = getattr(cfg, "dx_cluster_password", "") or getattr(cfg, "dx_pass", "")
-    except Exception:
-        pass
+        cfg.dx_cluster_port = 7300
 
     try:
         cfg.refresh_seconds = float(getattr(cfg, "space_weather_refresh_sec", getattr(cfg, "refresh_seconds", 1800.0)) or 1800.0)
@@ -403,8 +396,8 @@ def _callsign_db_path_cfg(cfg: AppConfig) -> str:
 def _db_is_mysql_cfg(cfg: AppConfig) -> bool:
     try:
         normalize_config(cfg)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_exception("_db_is_mysql_cfg normalize_config", e)
     return str(getattr(cfg, "database_type", "sqlite")).strip().lower() == "mysql"
 
 
@@ -543,6 +536,11 @@ def ensure_logbook_schema(cfg: AppConfig) -> None:
                 )
             """)
 
+        # Added for ADIF import/export: ADIF fields with no column of their own
+        # (QSL status, contest info, ...) so an export gives them back.
+        if "adif_extra" not in _table_columns_generic(conn, "qso_log"):
+            cur.execute("ALTER TABLE qso_log ADD COLUMN adif_extra TEXT")
+
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_station_callsigns_callsign ON station_callsigns (callsign)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qso_log_station_callsign_id ON qso_log (station_callsign_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qso_log_qso_date_time ON qso_log (qso_date, qso_time)")
@@ -585,10 +583,17 @@ def ensure_station_callsign(cfg: AppConfig, callsign: str, display_name: str = "
 
         if row:
             sid = int(row[0])
-            cur.execute(
-                f"UPDATE station_callsigns SET display_name = {ph}, is_active = 1, updated_utc = {ph} WHERE id = {ph}",
-                (display_name or "", now, sid),
-            )
+            if display_name:
+                cur.execute(
+                    f"UPDATE station_callsigns SET display_name = {ph}, is_active = 1, updated_utc = {ph} WHERE id = {ph}",
+                    (display_name, now, sid),
+                )
+            else:
+                # Don't wipe an existing display name when just re-selecting the default.
+                cur.execute(
+                    f"UPDATE station_callsigns SET is_active = 1, updated_utc = {ph} WHERE id = {ph}",
+                    (now, sid),
+                )
             if make_default:
                 cur.execute(f"UPDATE station_callsigns SET is_default = 1 WHERE id = {ph}", (sid,))
             conn.commit()
@@ -600,6 +605,94 @@ def ensure_station_callsign(cfg: AppConfig, callsign: str, display_name: str = "
         )
         conn.commit()
         return int(getattr(cur, "lastrowid", 0) or 0)
+    finally:
+        _db_close(conn)
+
+
+_STATION_CALL_RE = re.compile(r"^[A-Z0-9]+(/[A-Z0-9]+)*$")
+
+
+def valid_station_callsign(value) -> str:
+    """Return the cleaned callsign if it looks like a real one, else ""."""
+    raw = re.sub(r"\s+", "", str(value or "")).upper()
+    if not (3 <= len(raw) <= 20) or not _STATION_CALL_RE.match(raw):
+        return ""
+    call = _normalize_callsign(raw)
+    if not (re.search(r"[A-Z]", call) and re.search(r"\d", call)):
+        return ""
+    return call
+
+
+def count_qsos_for_station(cfg: AppConfig, station_id: int) -> int:
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+        cur.execute(f"SELECT COUNT(*) FROM qso_log WHERE station_callsign_id = {ph}", (station_id,))
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+    finally:
+        _db_close(conn)
+
+
+def update_station_callsign(cfg: AppConfig, station_id: int, new_callsign: str, display_name: str) -> int:
+    """Rename a station callsign. QSOs logged under it follow the change.
+
+    Returns the number of QSOs whose operator callsign was updated.
+    """
+    call = valid_station_callsign(new_callsign)
+    if not call:
+        raise ValueError(f"{new_callsign!r} doesn't look like a callsign")
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+        cur.execute(f"SELECT callsign FROM station_callsigns WHERE id = {ph}", (station_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("That callsign no longer exists")
+        old_call = str(row[0] or "")
+        cur.execute(f"SELECT id FROM station_callsigns WHERE callsign = {ph} AND id <> {ph}", (call, station_id))
+        if cur.fetchone():
+            raise ValueError(f"{call} is already in the list")
+        cur.execute(
+            f"UPDATE station_callsigns SET callsign = {ph}, display_name = {ph}, updated_utc = {ph} WHERE id = {ph}",
+            (call, display_name or "", utc_now_iso(), station_id),
+        )
+        changed = 0
+        if old_call != call:
+            cur.execute(
+                f"UPDATE qso_log SET operator_callsign = {ph} WHERE station_callsign_id = {ph} AND operator_callsign = {ph}",
+                (call, station_id, old_call),
+            )
+            changed = int(getattr(cur, "rowcount", 0) or 0)
+        conn.commit()
+        return changed
+    finally:
+        _db_close(conn)
+
+
+def delete_station_callsign(cfg: AppConfig, station_id: int) -> bool:
+    """Remove a station callsign.
+
+    With no QSOs it is deleted outright (returns True). If QSOs were logged
+    under it, it's hidden from the list instead so those QSOs keep their
+    station (returns False).
+    """
+    qsos = count_qsos_for_station(cfg, station_id)
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+        if qsos:
+            cur.execute(
+                f"UPDATE station_callsigns SET is_active = 0, is_default = 0, updated_utc = {ph} WHERE id = {ph}",
+                (utc_now_iso(), station_id),
+            )
+        else:
+            cur.execute(f"DELETE FROM station_callsigns WHERE id = {ph}", (station_id,))
+        conn.commit()
+        return not qsos
     finally:
         _db_close(conn)
 
@@ -630,12 +723,12 @@ def get_station_callsigns(cfg: AppConfig) -> List[dict]:
 
 
 def select_default_station_callsign(cfg: AppConfig, state: AppState) -> None:
-    preferred = _normalize_callsign(getattr(cfg, "logbook_default_station_callsign", "") or "")
+    preferred = valid_station_callsign(getattr(cfg, "logbook_default_station_callsign", "") or "")
     if preferred:
         try:
             ensure_station_callsign(cfg, preferred, make_default=True)
-        except Exception:
-            pass
+        except Exception as e:
+            _log_exception("select_default_station_callsign", e)
 
     calls = get_station_callsigns(cfg)
     if not calls:
@@ -875,8 +968,6 @@ def insert_qso_log(cfg: AppConfig, state: AppState, entry: dict) -> int:
     now = utc_now_iso()
     qso_date = str(entry.get("qso_date") or utc_today_date())
     qso_time = str(entry.get("qso_time") or utc_now_time())[:8]
-    freq_raw = str(entry.get("frequency_khz", "")).strip()
-    pwr_raw = str(entry.get("tx_power_w", "")).strip()
     frequency_khz = _optional_float(entry.get("frequency_khz", ""))
     tx_power_w = _optional_float(entry.get("tx_power_w", ""))
 
@@ -931,8 +1022,6 @@ def update_qso_log(cfg: AppConfig, qso_id: int, entry: dict) -> None:
     now = utc_now_iso()
     qso_date = str(entry.get("qso_date") or utc_today_date())
     qso_time = str(entry.get("qso_time") or utc_now_time())[:8]
-    freq_raw = str(entry.get("frequency_khz", "")).strip()
-    pwr_raw = str(entry.get("tx_power_w", "")).strip()
     frequency_khz = _optional_float(entry.get("frequency_khz", ""))
     tx_power_w = _optional_float(entry.get("tx_power_w", ""))
 
@@ -998,6 +1087,227 @@ def delete_qso_log(cfg: AppConfig, qso_id: int) -> None:
         _db_close(conn)
 
 
+
+# ---- ADIF import / export ----
+# ADIF field -> qso_log column. Anything else in a record is kept in adif_extra.
+_ADIF_TEXT_FIELDS = {
+    "RST_SENT": "rst_sent",
+    "RST_RCVD": "rst_recv",
+    "NAME": "their_name",
+    "QTH": "their_qth",
+    "GRIDSQUARE": "their_grid",
+    "COUNTRY": "their_country",
+}
+_ADIF_HANDLED = set(_ADIF_TEXT_FIELDS) | {
+    "CALL", "QSO_DATE", "TIME_ON", "BAND", "FREQ", "MODE", "SUBMODE",
+    "STATE", "VE_PROV", "TX_PWR", "COMMENT", "NOTES",
+    "STATION_CALLSIGN", "OPERATOR", "OWNER_CALLSIGN",
+}
+
+
+def adif_record_to_qso(rec: dict) -> Tuple[Optional[dict], str]:
+    """Convert one ADIF record to (qso entry dict, adif_extra string).
+
+    Returns (None, reason) if the record can't be used.
+    """
+    # Keep the callsign exactly as logged (W1VET/QRP, VE3/W1AW ...);
+    # _normalize_callsign() would strip the prefix/suffix.
+    call = re.sub(r"\s+", "", rec.get("CALL", "")).upper()
+    if not call:
+        return None, "no CALL"
+    if not re.fullmatch(r"[A-Z0-9/]+", call):
+        return None, f"bad CALL {rec.get('CALL', '')!r}"
+    d = re.sub(r"\D", "", rec.get("QSO_DATE", ""))
+    if len(d) != 8:
+        return None, f"{call}: bad QSO_DATE {rec.get('QSO_DATE', '')!r}"
+    t = re.sub(r"\D", "", rec.get("TIME_ON", ""))
+    if len(t) not in (4, 6):
+        return None, f"{call}: bad TIME_ON {rec.get('TIME_ON', '')!r}"
+    t = (t + "00")[:6]
+    try:
+        datetime(int(d[:4]), int(d[4:6]), int(d[6:8]), int(t[:2]), int(t[2:4]), int(t[4:6]))
+    except ValueError:
+        return None, f"{call}: invalid date/time {d} {t}"
+
+    freq_khz = None
+    if rec.get("FREQ", "").strip():
+        try:
+            freq_khz = round(float(rec["FREQ"]) * 1000.0, 3)
+        except ValueError:
+            pass
+    band = rec.get("BAND", "").strip().lower() or (_freq_to_band_name(freq_khz) if freq_khz else "")
+    tx_pwr = None
+    if rec.get("TX_PWR", "").strip():
+        try:
+            tx_pwr = float(re.sub(r"[^0-9.]", "", rec["TX_PWR"]))
+        except ValueError:
+            pass
+    remarks = " | ".join(v.strip() for v in (rec.get("COMMENT", ""), rec.get("NOTES", "")) if v and v.strip())
+
+    entry = {
+        "worked_callsign": call,
+        "qso_date": f"{d[:4]}-{d[4:6]}-{d[6:8]}",
+        "qso_time": f"{t[:2]}:{t[2:4]}:{t[4:6]}",
+        "band": band,
+        "frequency_khz": freq_khz,
+        "mode": rec.get("MODE", "").strip().upper(),
+        "submode": rec.get("SUBMODE", "").strip().upper(),
+        "their_state_province": (rec.get("STATE", "") or rec.get("VE_PROV", "")).strip(),
+        "tx_power_w": tx_pwr,
+        "remarks": remarks,
+        "station_callsign": rec.get("STATION_CALLSIGN", "") or rec.get("OPERATOR", ""),
+    }
+    for field_name, col in _ADIF_TEXT_FIELDS.items():
+        entry[col] = rec.get(field_name, "").strip()
+    extra = {k: v for k, v in rec.items() if k not in _ADIF_HANDLED and not k.startswith("_")}
+    return entry, (adif.fields_to_string(extra) if adif and extra else "")
+
+
+def adif_guess_station_callsign(header: dict, records: List[dict]) -> str:
+    """Station callsign the file was logged under, if it says."""
+    for rec in records[:50]:
+        for key in ("STATION_CALLSIGN", "OPERATOR", "OWNER_CALLSIGN"):
+            call = valid_station_callsign(rec.get(key, ""))
+            if call:
+                return call
+    for key in ("STATION_CALLSIGN", "OPERATOR", "OWNER_CALLSIGN"):
+        call = valid_station_callsign(header.get(key, ""))
+        if call:
+            return call
+    m = re.search(r"\bFor\s+([A-Z0-9/]+)", header.get("_PREAMBLE", ""), re.IGNORECASE)  # eQSL style
+    return valid_station_callsign(m.group(1)) if m else ""
+
+
+def _qso_dupe_key(call: str, qso_date: str, qso_time: str, band: str, mode: str) -> tuple:
+    return (call.upper(), qso_date, str(qso_time or "")[:5], (band or "").lower(), (mode or "").upper())
+
+
+def import_adif_records(cfg: AppConfig, records: List[dict], default_station_id: int,
+                        default_station_call: str) -> dict:
+    """Insert ADIF records into qso_log. Skips QSOs already in the log
+    (same station, call, date, time to the minute, band and mode)."""
+    stats = {"imported": 0, "duplicates": 0, "skipped": 0, "errors": []}
+    station_ids = {default_station_call: default_station_id}
+    ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT station_callsign_id, worked_callsign, qso_date, qso_time, band, mode FROM qso_log")
+        existing = {
+            (int(r[0]),) + _qso_dupe_key(str(r[1] or ""), str(r[2] or ""), str(r[3] or ""), str(r[4] or ""), str(r[5] or ""))
+            for r in (cur.fetchall() or [])
+        }
+        now = utc_now_iso()
+        sql = f"""
+            INSERT INTO qso_log (
+                station_callsign_id, operator_callsign, qso_date, qso_time,
+                worked_callsign, band, frequency_khz, mode, submode,
+                rst_sent, rst_recv, their_name, their_qth, their_grid,
+                their_state_province, their_country, tx_power_w, remarks,
+                adif_extra, created_utc, updated_utc
+            ) VALUES ({", ".join([ph] * 21)})
+        """
+        for rec in records:
+            entry, extra = adif_record_to_qso(rec)
+            if entry is None:
+                stats["skipped"] += 1
+                if len(stats["errors"]) < 20:
+                    stats["errors"].append(extra)
+                continue
+            st_call = valid_station_callsign(entry.pop("station_callsign", "")) or default_station_call
+            if st_call not in station_ids:
+                # Record says it was logged by a different station callsign.
+                station_ids[st_call] = ensure_station_callsign(cfg, st_call) or default_station_id
+            sid = station_ids[st_call]
+            key = (sid,) + _qso_dupe_key(entry["worked_callsign"], entry["qso_date"], entry["qso_time"], entry["band"], entry["mode"])
+            if key in existing:
+                stats["duplicates"] += 1
+                continue
+            existing.add(key)
+            cur.execute(sql, (
+                sid, st_call, entry["qso_date"], entry["qso_time"], entry["worked_callsign"],
+                entry["band"], entry["frequency_khz"], entry["mode"], entry["submode"],
+                entry["rst_sent"], entry["rst_recv"], entry["their_name"], entry["their_qth"],
+                entry["their_grid"].upper(), entry["their_state_province"], entry["their_country"],
+                entry["tx_power_w"], entry["remarks"], extra, now, now,
+            ))
+            stats["imported"] += 1
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        _db_close(conn)
+    return stats
+
+
+def export_adif(cfg: AppConfig, path: str, station_id: Optional[int] = None) -> int:
+    """Write QSOs (all, or one station callsign's) to an ADI file. Returns count."""
+    if adif is None:
+        raise RuntimeError("adif.py is missing from the hamclock folder")
+    ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT q.worked_callsign, q.qso_date, q.qso_time, q.band, q.frequency_khz, q.mode, q.submode,
+                   q.rst_sent, q.rst_recv, q.their_name, q.their_qth, q.their_grid,
+                   q.their_state_province, q.their_country, q.tx_power_w, q.remarks, q.adif_extra,
+                   COALESCE(s.callsign, q.operator_callsign)
+            FROM qso_log q LEFT JOIN station_callsigns s ON s.id = q.station_callsign_id
+        """
+        params: tuple = ()
+        if station_id:
+            sql += f" WHERE q.station_callsign_id = {ph}"
+            params = (station_id,)
+        sql += " ORDER BY q.qso_date, q.qso_time, q.id"
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+    finally:
+        _db_close(conn)
+
+    def _num(v):
+        if v is None or v == "":
+            return ""
+        return f"{float(v):.6f}".rstrip("0").rstrip(".")
+
+    out = []
+    for r in rows:
+        (call, qdate, qtime, band, fkhz, mode, submode, rst_s, rst_r, name, qth, grid,
+         state_prov, country, pwr, remarks, extra, station) = r
+        rec = {
+            "CALL": call or "",
+            "QSO_DATE": str(qdate or "").replace("-", ""),
+            "TIME_ON": re.sub(r"\D", "", str(qtime or ""))[:6],
+            "BAND": band or "",
+            "FREQ": _num(float(fkhz) / 1000.0) if fkhz not in (None, "") else "",
+            "MODE": mode or "",
+            "SUBMODE": submode or "",
+            "RST_SENT": rst_s or "",
+            "RST_RCVD": rst_r or "",
+            "NAME": name or "",
+            "QTH": qth or "",
+            "GRIDSQUARE": grid or "",
+            "STATE": state_prov or "",
+            "COUNTRY": country or "",
+            "TX_PWR": _num(pwr),
+            "COMMENT": remarks or "",
+            "STATION_CALLSIGN": station or "",
+        }
+        for k, v in adif.string_to_fields(extra or "").items():
+            rec.setdefault(k, v)
+        out.append(rec)
+
+    text = adif.write_adif(out, program_id="hamclock")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return len(out)
+
 def set_default_station_callsign(cfg: AppConfig, station_id: int) -> None:
     conn = _db_connect_cfg(cfg)
     try:
@@ -1026,7 +1336,7 @@ def _refresh_logbook_view(cfg: AppConfig, state: AppState) -> None:
     refresh_logbook_lines(cfg, state)
 
 
-def _popup_menu(stdscr, title: str, items: List[str], _line: str = "Enter=Select Esc=Cancel") -> int:
+def _popup_menu(stdscr, title: str, items: List[str], help_line: str = "Enter=Select Esc=Cancel") -> int:
     if not items:
         return -1
     idx = 0
@@ -1160,22 +1470,22 @@ def _draw_qso_form(win, title, fields, idx, message=""):
         scroll = idx - visible_rows + 1
 
     visible = fields[scroll: scroll + visible_rows]
-    for row, field in enumerate(visible):
+    for row, fld in enumerate(visible):
         y = top_y + row
         is_sel = (scroll + row) == idx
         style = curses.A_REVERSE if is_sel else curses.A_NORMAL
-        label = str(field.get("label", ""))[: label_w - 1]
-        value = str(field.get("value", "") or "")
-        if is_sel and not field.get("readonly"):
+        label = str(fld.get("label", ""))[: label_w - 1]
+        value = str(fld.get("value", "") or "")
+        if is_sel and not fld.get("readonly"):
             value = value + "_"
-        if field.get("readonly"):
+        if fld.get("readonly"):
             value_style = style | curses.A_DIM
         else:
             value_style = style
         safe_addstr(win, y, 2, f"{label:<{label_w-1}}", style)
         safe_addstr(win, y, val_x, value[:val_w], value_style)
-        field["_screen_y"] = y
-        field["_screen_x"] = val_x
+        fld["_screen_y"] = y
+        fld["_screen_x"] = val_x
 
     if message:
         safe_addstr(win, h - 3, 2, message[: max(1, w - 4)], curses.A_BOLD)
@@ -1291,8 +1601,8 @@ def _lookup_qso_autofill_local_db(conn, callsign: str) -> dict:
                 result = _extract_qso_autofill_from_payload(payload, callsign)
                 if any(result.get(k) for k in ("their_name", "their_qth", "their_grid", "their_state_province", "their_country")):
                     return result
-    except Exception:
-        pass
+    except Exception as e:
+        _log_exception("_lookup_qso_autofill_local_db calls", e)
 
     # Fall back to hamcall_calls columns when available.
     try:
@@ -1327,8 +1637,8 @@ def _lookup_qso_autofill_local_db(conn, callsign: str) -> dict:
                         "their_country": country,
                         "source": "hamcall_calls",
                     }
-    except Exception:
-        pass
+    except Exception as e:
+        _log_exception("_lookup_qso_autofill_local_db hamcall_calls", e)
 
     return {}
 
@@ -1620,13 +1930,66 @@ def qso_entry_dialog(stdscr, cfg: AppConfig, state: AppState, qso_id: Optional[i
         except Exception:
             pass
 
+def _station_input_pos(stdscr):
+    maxy, maxx = stdscr.getmaxyx()
+    w = min(60, maxx - 4)
+    return max(1, maxy // 2 - 2), max(1, (maxx - w) // 2), w
+
+
+def _pick_station_callsign(stdscr, calls: List[dict], title: str) -> Optional[dict]:
+    if not calls:
+        _simple_message_popup(stdscr, "Callsign", "No station callsigns yet.")
+        return None
+    labels = [
+        f"{c['callsign']}{'  - ' + c['display_name'] if c.get('display_name') else ''}{' [default]' if c['is_default'] else ''}"
+        for c in calls
+    ]
+    idx = _popup_menu(stdscr, title, labels)
+    return calls[idx] if 0 <= idx < len(calls) else None
+
+
+def _ask_station_callsign(stdscr, prompt: str, initial: str = "") -> Optional[str]:
+    """Prompt until a valid callsign is entered. None if Esc."""
+    y0, x0, w = _station_input_pos(stdscr)
+    text = initial
+    while True:
+        text = _input_box(stdscr, y0, x0, w, prompt, text)
+        if text is None:
+            return None
+        call = valid_station_callsign(text)
+        if call:
+            return call
+        _simple_message_popup(stdscr, "Callsign",
+                              f"'{text.strip()}' isn't a valid callsign.\nUse letters, numbers and / only, e.g. VE6CPU or VE6CPU/P.")
+
+
+def _after_station_change(cfg: AppConfig, state: AppState) -> None:
+    """Re-pick the active callsign and persist the default so the settings file
+    never points at a callsign that was edited or removed."""
+    select_default_station_callsign(cfg, state)
+    calls = get_station_callsigns(cfg)
+    default = next((c for c in calls if c["is_default"]), None)
+    cfg.logbook_default_station_callsign = default["callsign"] if default else ""
+    try:
+        save_config(cfg)
+    except Exception as e:
+        _log_exception("save default station callsign", e)
+    _refresh_logbook_view(cfg, state)
+
+
 def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
     while True:
         calls = get_station_callsigns(cfg)
-        items = [f"Use: {c['callsign']}{' [default]' if c['is_default'] else ''}" for c in calls]
-        items += ["Add new callsign", "Set selected callsign as default", "Cancel"]
+        items = [
+            f"Use: {c['callsign']}{' [default]' if c['is_default'] else ''}"
+            + (" <" if c["id"] == state.selected_station_callsign_id else "")
+            for c in calls
+        ]
+        actions = ["Add new callsign", "Edit a callsign", "Delete a callsign",
+                   "Set selected callsign as default", "Cancel"]
+        items += actions
         idx = _popup_menu(stdscr, "Station Callsigns", items)
-        if idx < 0 or idx == len(items) - 1:
+        if idx < 0:
             return False
         if idx < len(calls):
             chosen = calls[idx]
@@ -1637,29 +2000,32 @@ def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
             state.status_line = f"Logging for {chosen['callsign']}"
             state.dirty_status = True
             return True
-        if idx == len(calls):
-            maxy, maxx = stdscr.getmaxyx()
-            w = min(60, maxx - 4)
-            y0 = max(1, maxy // 2 - 2)
-            x0 = max(1, (maxx - w) // 2)
-            call = _input_box(stdscr, y0, x0, w, "New Callsign: ", "")
-            if not call:
+
+        action = actions[idx - len(calls)]
+        if action == "Cancel":
+            return False
+
+        if action == "Add new callsign":
+            call = _ask_station_callsign(stdscr, "New Callsign: ")
+            if call is None:
                 continue
+            y0, x0, w = _station_input_pos(stdscr)
             display = _input_box(stdscr, y0 + 3, x0, w, "Display Name: ", "")
-            make_default = _confirm_dialog(stdscr, "Default Callsign", f"Make {_normalize_callsign(call)} the default callsign?")
+            if display is None:
+                continue
+            make_default = _confirm_dialog(stdscr, "Default Callsign", f"Make {call} the default callsign?")
             try:
-                sid = ensure_station_callsign(cfg, call, display_name=display, make_default=make_default)
-                select_default_station_callsign(cfg, state)
+                sid = ensure_station_callsign(cfg, call, display_name=display.strip(), make_default=make_default)
+                if make_default:
+                    _after_station_change(cfg, state)
                 if sid:
-                    calls2 = get_station_callsigns(cfg)
-                    for c in calls2:
+                    for c in get_station_callsigns(cfg):
                         if c["id"] == sid:
                             state.selected_station_callsign_id = c["id"]
                             state.selected_station_callsign = c["callsign"]
-                            cfg.logbook_default_station_callsign = c["callsign"]
                             break
                 _refresh_logbook_view(cfg, state)
-                state.status_line = f"Added callsign {state.selected_station_callsign or _normalize_callsign(call)}"
+                state.status_line = f"Added callsign {call}"
                 state.dirty_status = True
                 return True
             except Exception as e:
@@ -1667,14 +2033,71 @@ def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
                 state.status_line = f"Callsign add failed: {e}"
                 state.dirty_status = True
                 continue
-        if idx == len(calls) + 1:
+
+        if action == "Edit a callsign":
+            target = _pick_station_callsign(stdscr, calls, "Edit which callsign?")
+            if target is None:
+                continue
+            call = _ask_station_callsign(stdscr, "Callsign: ", target["callsign"])
+            if call is None:
+                continue
+            y0, x0, w = _station_input_pos(stdscr)
+            display = _input_box(stdscr, y0 + 3, x0, w, "Display Name: ", target.get("display_name", ""))
+            if display is None:
+                continue
+            try:
+                moved = update_station_callsign(cfg, target["id"], call, display.strip())
+                current_default = valid_station_callsign(cfg.logbook_default_station_callsign)
+                if current_default in ("", target["callsign"]):
+                    # Otherwise the old name would be re-added as the default.
+                    cfg.logbook_default_station_callsign = call if target["is_default"] or current_default else ""
+                if state.selected_station_callsign_id == target["id"]:
+                    state.selected_station_callsign = call
+                _after_station_change(cfg, state)
+                msg = f"Changed {target['callsign']} to {call}"
+                if moved:
+                    msg += f" ({moved} QSO{'s' if moved != 1 else ''} updated)"
+                state.status_line = msg
+                state.dirty_status = True
+            except Exception as e:
+                _simple_message_popup(stdscr, "Callsign", f"Unable to change callsign:\n{e}")
+            continue
+
+        if action == "Delete a callsign":
+            target = _pick_station_callsign(stdscr, calls, "Delete which callsign?")
+            if target is None:
+                continue
+            try:
+                qsos = count_qsos_for_station(cfg, target["id"])
+                if qsos:
+                    question = (f"{target['callsign']} has {qsos} QSO{'s' if qsos != 1 else ''} logged.\n"
+                                "Remove it from this list? The QSOs are kept.")
+                else:
+                    question = f"Delete {target['callsign']}?"
+                if not _confirm_dialog(stdscr, "Delete Callsign", question):
+                    continue
+                delete_station_callsign(cfg, target["id"])
+                if state.selected_station_callsign_id == target["id"]:
+                    state.selected_station_callsign_id = None
+                    state.selected_station_callsign = ""
+                if valid_station_callsign(cfg.logbook_default_station_callsign) == target["callsign"] \
+                        or not valid_station_callsign(cfg.logbook_default_station_callsign):
+                    cfg.logbook_default_station_callsign = ""
+                _after_station_change(cfg, state)
+                state.status_line = f"Removed {target['callsign']}"
+                state.dirty_status = True
+            except Exception as e:
+                _simple_message_popup(stdscr, "Callsign", f"Unable to delete callsign:\n{e}")
+            continue
+
+        if action == "Set selected callsign as default":
             if not state.selected_station_callsign_id:
                 _simple_message_popup(stdscr, "Callsign", "No callsign is currently selected.")
                 continue
             try:
                 set_default_station_callsign(cfg, state.selected_station_callsign_id)
                 cfg.logbook_default_station_callsign = state.selected_station_callsign
-                _refresh_logbook_view(cfg, state)
+                _after_station_change(cfg, state)
                 state.status_line = f"Default callsign set to {state.selected_station_callsign}"
                 state.dirty_status = True
                 return True
@@ -1684,6 +2107,151 @@ def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
                 state.dirty_status = True
                 continue
 
+
+
+def _adif_candidate_files() -> List[str]:
+    """ADIF files (or zips holding one) in the hamclock folder, ~ and ~/Downloads."""
+    dirs = [_app_base_dir(), os.path.expanduser("~"), os.path.expanduser("~/Downloads")]
+    seen, found = set(), []
+    for d in dirs:
+        for pattern in ("*.adi", "*.adif", "*.ADI", "*.ADIF", "*.zip"):
+            for path in glob.glob(os.path.join(d, pattern)):
+                real = os.path.realpath(path)
+                if real in seen or not os.path.isfile(real):
+                    continue
+                seen.add(real)
+                if path.lower().endswith(".zip"):
+                    try:
+                        import zipfile
+                        with zipfile.ZipFile(path) as z:
+                            if not any(n.lower().endswith((".adi", ".adif")) for n in z.namelist()):
+                                continue
+                    except Exception:
+                        continue
+                found.append(path)
+    found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return found[:15]
+
+
+def _short_path(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def adif_import_dialog(stdscr, cfg: AppConfig, state: AppState) -> None:
+    if adif is None:
+        _simple_message_popup(stdscr, "ADIF Import", "adif.py is missing from the hamclock folder.")
+        return
+    ensure_logbook_schema(cfg)
+
+    files = _adif_candidate_files()
+    items = [_short_path(f) for f in files] + ["Type a path...", "Cancel"]
+    idx = _popup_menu(stdscr, "Import which ADIF file?", items)
+    if idx < 0 or items[idx] == "Cancel":
+        return
+    if idx < len(files):
+        path = files[idx]
+    else:
+        y0, x0, w = _station_input_pos(stdscr)
+        typed = _input_box(stdscr, y0, x0, w, "File: ", "~/")
+        if not typed or not typed.strip():
+            return
+        path = os.path.expanduser(typed.strip())
+        if not os.path.isabs(path):
+            path = os.path.join(_app_base_dir(), path)
+
+    try:
+        header, records, read_name = adif.read_adif_file(path)
+    except Exception as e:
+        _simple_message_popup(stdscr, "ADIF Import", f"Couldn't read {_short_path(path)}:\n{e}")
+        return
+    if not records:
+        _simple_message_popup(stdscr, "ADIF Import", f"No QSOs found in {os.path.basename(read_name)}.")
+        return
+
+    # Which station callsign do these QSOs belong to?
+    calls = get_station_callsigns(cfg)
+    guess = adif_guess_station_callsign(header, records)
+    choices: List[Tuple[str, Optional[dict]]] = []
+    if guess and not any(c["callsign"] == guess for c in calls):
+        choices.append((f"Log under {guess} (add it)", {"id": None, "callsign": guess}))
+    ordered = sorted(calls, key=lambda c: (c["callsign"] != guess, c["id"] != state.selected_station_callsign_id))
+    for c in ordered:
+        choices.append((f"Log under {c['callsign']}", c))
+    choices.append(("Add a different callsign...", {"id": None, "callsign": ""}))
+    labels = [c[0] for c in choices] + ["Cancel"]
+    pick = _popup_menu(stdscr, f"{len(records)} QSOs - station callsign?", labels)
+    if pick < 0 or pick >= len(choices):
+        return
+    station = dict(choices[pick][1])
+    if not station["callsign"]:
+        call = _ask_station_callsign(stdscr, "Station Callsign: ")
+        if call is None:
+            return
+        station["callsign"] = call
+    if not station["id"]:
+        station["id"] = ensure_station_callsign(cfg, station["callsign"])
+
+    if not _confirm_dialog(stdscr, "ADIF Import",
+                           f"Import {len(records)} QSOs from\n{os.path.basename(read_name)}\n"
+                           f"under {station['callsign']}?\nQSOs already in the log are skipped."):
+        return
+    state.status_line = f"Importing {len(records)} QSOs..."
+    state.dirty_status = True
+    try:
+        stats = import_adif_records(cfg, records, station["id"], station["callsign"])
+    except Exception as e:
+        _simple_message_popup(stdscr, "ADIF Import", f"Import failed, nothing was saved:\n{e}")
+        return
+
+    if not state.selected_station_callsign_id:
+        state.selected_station_callsign_id = station["id"]
+        state.selected_station_callsign = station["callsign"]
+    _refresh_logbook_view(cfg, state)
+    msg = [f"Imported:   {stats['imported']}",
+           f"Already in log (skipped): {stats['duplicates']}"]
+    if stats["skipped"]:
+        msg.append(f"Unreadable (skipped): {stats['skipped']}")
+        msg.extend("  " + e for e in stats["errors"][:5])
+    state.status_line = f"ADIF import: {stats['imported']} added, {stats['duplicates']} duplicates, {stats['skipped']} skipped"
+    state.dirty_status = True
+    _simple_message_popup(stdscr, "ADIF Import", "\n".join(msg))
+
+
+def adif_export_dialog(stdscr, cfg: AppConfig, state: AppState) -> None:
+    if adif is None:
+        _simple_message_popup(stdscr, "ADIF Export", "adif.py is missing from the hamclock folder.")
+        return
+    ensure_logbook_schema(cfg)
+    calls = get_station_callsigns(cfg)
+    station = None
+    if len(calls) > 1:
+        labels = ["All QSOs"] + [f"Only {c['callsign']}" for c in calls] + ["Cancel"]
+        idx = _popup_menu(stdscr, "Export which QSOs?", labels)
+        if idx < 0 or idx == len(labels) - 1:
+            return
+        station = calls[idx - 1] if idx > 0 else None
+    name_call = (station or (calls[0] if len(calls) == 1 else None) or {}).get("callsign", "hamclock")
+    default = f"{name_call.replace('/', '-')}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.adi"
+    y0, x0, w = _station_input_pos(stdscr)
+    typed = _input_box(stdscr, y0, x0, w, "Save as: ", default)
+    if not typed or not typed.strip():
+        return
+    path = os.path.expanduser(typed.strip())
+    if not os.path.isabs(path):
+        path = os.path.join(_app_base_dir(), path)
+    if not path.lower().endswith((".adi", ".adif")):
+        path += ".adi"
+    if os.path.exists(path) and not _confirm_dialog(stdscr, "ADIF Export", f"{_short_path(path)} exists.\nOverwrite it?"):
+        return
+    try:
+        n = export_adif(cfg, path, station["id"] if station else None)
+    except Exception as e:
+        _simple_message_popup(stdscr, "ADIF Export", f"Export failed:\n{e}")
+        return
+    state.status_line = f"Exported {n} QSOs to {_short_path(path)}"
+    state.dirty_status = True
+    _simple_message_popup(stdscr, "ADIF Export", f"Exported {n} QSOs to\n{_short_path(path)}")
 
 def delete_selected_qso_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
     rows = list(getattr(state, "logbook_recent_rows", []) or [])
@@ -1719,13 +2287,15 @@ def apply_config_runtime(cfg: AppConfig, state: AppState) -> None:
     state.cfg = cfg
     try:
         initialize_online_lookup_session(cfg, state)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_exception("apply_config_runtime lookup session", e)
     try:
         with state.dedx_lookup_lock:
             state.dedx_lookup_cache.clear()
     except Exception:
         pass
+    state.rig_unsupported.clear()
+    state.data_refresh_event.set()
     state.dirty_space = True
     state.dirty_dx = True
     state.dirty_wx_static = True
@@ -1758,22 +2328,96 @@ def _test_database_connection_cfg(cfg: AppConfig):
     return _test_sqlite_connection_cfg(cfg)
 
 
-def _input_box(stdscr, y0, x0, w, prompt, initial=""):
+def _read_line(win, y: int, x: int, width: int, initial: str = "", mask: bool = False) -> Optional[str]:
+    """Edit one line of text in place.
+
+    The existing value is pre-filled and editable. Enter returns the text,
+    Esc returns None (cancel). Left/Right/Home/End move, Backspace/Delete
+    remove, Ctrl-U clears the line. Replaces curses getstr(), which can't
+    cancel (it typed Esc in as ^[) and started from an empty buffer.
+    """
+    width = max(1, int(width))
+    buf = list(str(initial or ""))
+    pos = len(buf)
+    try:
+        old_cursor = curses.curs_set(1)
+    except Exception:
+        old_cursor = None
+    try:
+        curses.noecho()
+    except Exception:
+        pass
+    win.keypad(True)
+    win.timeout(-1)
+    try:
+        while True:
+            start = max(0, pos - width + 1)
+            text = "".join(buf)
+            shown = ("*" * len(text)) if mask else text
+            safe_addstr(win, y, x, shown[start:start + width].ljust(width))
+            try:
+                win.move(y, x + (pos - start))
+            except Exception:
+                pass
+            win.refresh()
+            k = win.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            if k == 27:
+                tail = read_escape_tail(win)
+                win.timeout(-1)
+                if not tail:
+                    return None
+                if tail in ("[D", "OD"):
+                    pos = max(0, pos - 1)
+                elif tail in ("[C", "OC"):
+                    pos = min(len(buf), pos + 1)
+                continue
+            if k in (10, 13, curses.KEY_ENTER):
+                return "".join(buf)
+            if k in (curses.KEY_BACKSPACE, 127, 8):
+                if pos > 0:
+                    del buf[pos - 1]
+                    pos -= 1
+            elif k == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+            elif k == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif k == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif k in (curses.KEY_HOME, 1):   # Home / Ctrl-A
+                pos = 0
+            elif k in (curses.KEY_END, 5):    # End / Ctrl-E
+                pos = len(buf)
+            elif k == 21:                     # Ctrl-U
+                buf = []
+                pos = 0
+            elif 32 <= k <= 126:
+                buf.insert(pos, chr(k))
+                pos += 1
+    finally:
+        if old_cursor is not None:
+            try:
+                curses.curs_set(old_cursor)
+            except Exception:
+                pass
+
+
+def _input_box(stdscr, y0, x0, w, prompt, initial="", mask: Optional[bool] = None):
+    """Small boxed prompt. Returns the text, or None if Esc was pressed."""
+    if mask is None:
+        mask = "password" in str(prompt).lower()
+    maxy, maxx = stdscr.getmaxyx()
+    w = max(10, min(w, maxx - x0))
+    y0 = max(0, min(y0, maxy - 3))
     win = curses.newwin(3, w, y0, x0)
     win.erase()
     win.box()
     safe_addstr(win, 1, 2, prompt[: max(1, w - 4)])
-    if initial:
-        safe_addstr(win, 1, min(w - 3, 2 + len(prompt)), str(initial)[: max(0, w - (4 + len(prompt)))])
-    win.refresh()
-    curses.echo()
-    try:
-        raw = win.getstr(1, 2 + len(prompt), max(1, w - (4 + len(prompt))))
-        return raw.decode("utf-8", errors="ignore") if raw is not None else ""
-    except Exception:
-        return initial
-    finally:
-        curses.noecho()
+    safe_addstr(win, 2, max(1, w - 22), " Enter=OK Esc=Cancel "[: max(0, w - 2)], curses.A_DIM)
+    field_x = min(w - 3, 2 + len(prompt))
+    return _read_line(win, 1, field_x, max(1, w - field_x - 2), str(initial or ""), mask=mask)
 
 
 
@@ -1852,12 +2496,61 @@ def poll_rigctld_once(cfg: AppConfig, state: AppState) -> None:
         state.rig_frequency = _rig_format_freq_hz(freq_raw)
         state.rig_mode = mode or "-"
         state.rig_status_line = f"Radio: {host}:{port}"
+        _poll_rigctld_extras(host, port, state)
     except Exception as e:
         state.rig_frequency = "-"
         state.rig_mode = "-"
+        state.rig_comp = state.rig_nb = state.rig_nr = None
+        state.rig_preamp = state.rig_agc = "-"
+        # radio may have been swapped/restarted; re-probe extras next time
+        state.rig_unsupported.clear()
         state.rig_status_line = f"Radio: {type(e).__name__}"
     state.dirty_rig = True
     state.dirty_status = True
+
+
+# rigctld "u" = get_func (on/off), "l" = get_level (numeric)
+_RIG_EXTRA_QUERIES = (
+    ("rig_comp", "u COMP", _rigctld_bool_token),
+    ("rig_nb", "u NB", _rigctld_bool_token),
+    ("rig_nr", "u NR", _rigctld_bool_token),
+    ("rig_preamp", "l PREAMP", _rig_parse_preamp),
+    ("rig_agc", "l AGC", _rig_parse_agc),
+)
+
+
+def _poll_rigctld_extras(host: str, port: int, state: AppState) -> None:
+    """Read COMP/NB/NR/PREAMP/AGC. Anything the rig or backend doesn't support
+    (rigctld answers 'RPRT -n') is remembered and skipped on later polls."""
+    for attr, cmd, parse in _RIG_EXTRA_QUERIES:
+        if cmd in state.rig_unsupported:
+            continue
+        try:
+            raw = _rigctld_command(host, port, cmd)
+        except Exception as e:
+            _debug_log(f"rigctld {cmd!r} failed: {e}")
+            continue
+        first = (raw.splitlines()[0].strip() if raw.strip() else "")
+        if not first or first.upper().startswith("RPRT"):
+            state.rig_unsupported.add(cmd)
+            continue
+        setattr(state, attr, parse(first))
+
+
+def rig_poll_worker(cfg: AppConfig, state: AppState) -> None:
+    """Poll rigctld off the UI thread so a missing radio can't freeze the clock."""
+    while state.running:
+        try:
+            poll_rigctld_once(cfg, state)
+        except Exception as e:
+            _log_exception("rig_poll_worker", e)
+        try:
+            delay = max(0.2, float(getattr(cfg, "rigctld_poll_ms", 1000) or 1000) / 1000.0)
+        except Exception:
+            delay = 1.0
+        if not getattr(cfg, "rig_control_enabled", False):
+            delay = max(delay, 2.0)
+        time.sleep(delay)
 
 
 def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
@@ -1867,6 +2560,7 @@ def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
         ("rigctld_port", "rigctld Port", "int"),
         ("rigctld_poll_ms", "Poll Interval ms", "int"),
     ]
+    original = {key: getattr(cfg, key, None) for key, _, _ in fields}
     idx = 0
     curses.curs_set(0)
     stdscr.nodelay(False)
@@ -1899,6 +2593,9 @@ def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
         k = win.getch()
 
         if k in (27,):
+            # Esc = cancel: put back anything toggled or typed in this dialog
+            for key, value in original.items():
+                setattr(cfg, key, value)
             try:
                 win.erase()
                 win.noutrefresh()
@@ -1914,6 +2611,7 @@ def edit_rig_control_dialog(stdscr, cfg: AppConfig, state: AppState):
             idx = min(len(fields) - 1, idx + 1)
         elif k in (ord("s"), ord("S")):
             save_config(cfg)
+            state.rig_unsupported.clear()
             poll_rigctld_once(cfg, state)
             try:
                 win.erase()
@@ -2017,7 +2715,8 @@ def edit_shortwave_dialog(stdscr, cfg: AppConfig, state: AppState):
 
 
 def file_menu_dialog(stdscr, cfg: AppConfig, state: AppState):
-    items = ["Settings", "Rig Control", "DX Cluster", "Local Database", "Shortwave", "Online lookup", "Look up call sign", "Quit"]
+    items = ["Settings", "Rig Control", "DX Cluster", "Local Database", "Shortwave", "Online lookup", "Look up call sign",
+             "Import ADIF log", "Export ADIF log", "Quit"]
     idx = 0
     curses.curs_set(0)
     stdscr.nodelay(False)
@@ -2084,6 +2783,14 @@ def file_menu_dialog(stdscr, cfg: AppConfig, state: AppState):
                 edit_online_lookup_dialog(stdscr, cfg, state)
             elif choice == "Look up call sign":
                 callsign_lookup_dialog(stdscr, cfg, state)
+            elif choice in ("Import ADIF log", "Export ADIF log"):
+                try:
+                    if choice.startswith("Import"):
+                        adif_import_dialog(stdscr, cfg, state)
+                    else:
+                        adif_export_dialog(stdscr, cfg, state)
+                except Exception as e:
+                    _simple_message_popup(stdscr, "ADIF", str(e))
             elif choice == "Quit":
                 state.running = False
                 curses.curs_set(0)
@@ -2143,10 +2850,6 @@ def edit_dx_cluster_dialog(stdscr, cfg: AppConfig, state: AppState):
                 cfg.dx_cluster_username = values["dx_cluster_username"].strip()
                 cfg.dx_cluster_password = values["dx_cluster_password"]
                 cfg.dx_filter = values["dx_filter"].strip()
-                cfg.dx_host = cfg.dx_cluster_host
-                cfg.dx_port = cfg.dx_cluster_port
-                cfg.dx_user = cfg.dx_cluster_username
-                cfg.dx_pass = cfg.dx_cluster_password
                 save_config(cfg)
                 apply_config_runtime(cfg, state)
                 state.status_line = "DX Cluster settings saved and applied"
@@ -2270,91 +2973,6 @@ def edit_local_database_dialog(stdscr, cfg: AppConfig, state: AppState):
             if s is not None:
                 values[attr] = s
 
-
-def edit_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
-    fields = [
-        ("World Map Refresh (sec)", "world_map_refresh_sec"),
-        ("Space Weather Refresh (sec)", "space_weather_refresh_sec"),
-        ("Latitude (Decimal)", "latitude_decimal"),
-        ("Longitude (Decimal)", "longitude_decimal"),
-        ("Grid Square", "grid_square"),
-        ("Local Weather Refresh (sec)", "local_weather_refresh_sec"),
-        ("Time Zone", "time_zone"),
-    ]
-
-    normalize_config(cfg)
-    if not getattr(cfg, "time_zone", ""):
-        cfg.time_zone = "America/Edmonton"
-
-    values = {}
-    for _, attr in fields:
-        v = getattr(cfg, attr, "")
-        values[attr] = "" if v is None else str(v)
-
-    idx = 0
-    curses.curs_set(1)
-    stdscr.nodelay(False)
-
-    while True:
-        maxy, maxx = stdscr.getmaxyx()
-        h = min(maxy - 4, len(fields) + 6)
-        w = min(maxx - 4, max(60, min(100, maxx - 4)))
-        y0 = (maxy - h) // 2
-        x0 = (maxx - w) // 2
-        win = curses.newwin(h, w, y0, x0)
-        win.keypad(True)
-        win.erase()
-        win.box()
-        title = " Settings (Enter=edit, F2=Save, ESC=Cancel) "
-        safe_addstr(win, 0, max(2, (w - len(title)) // 2), title, curses.A_BOLD)
-
-        for row, (label, attr) in enumerate(fields):
-            y = 2 + row
-            is_sel = row == idx
-            style = curses.A_REVERSE if is_sel else curses.A_NORMAL
-            val = values.get(attr, "")
-            safe_addstr(win, y, 2, f"{label}:"[: w - 4], style)
-            safe_addstr(win, y, 32, val[: max(1, w - 34)], style)
-
-        safe_addstr(win, h - 2, 2, "Up/Down select. Enter edits. F2 saves and applies to the running app.", curses.A_DIM)
-        win.refresh()
-
-        k = win.getch()
-        if k in (27,):
-            curses.curs_set(0)
-            stdscr.timeout(100)
-            return
-        elif k == curses.KEY_UP:
-            idx = max(0, idx - 1)
-        elif k == curses.KEY_DOWN:
-            idx = min(len(fields) - 1, idx + 1)
-        elif k == curses.KEY_F2:
-            try:
-                cfg.world_map_refresh_sec = float(values.get("world_map_refresh_sec", "300") or "300")
-                cfg.space_weather_refresh_sec = float(values.get("space_weather_refresh_sec", "1800") or "1800")
-                cfg.latitude_decimal = None if str(values.get("latitude_decimal", "")).strip() == "" else float(values.get("latitude_decimal"))
-                cfg.longitude_decimal = None if str(values.get("longitude_decimal", "")).strip() == "" else float(values.get("longitude_decimal"))
-                cfg.grid_square = values.get("grid_square", "").strip()
-                cfg.local_weather_refresh_sec = float(values.get("local_weather_refresh_sec", "1800") or "1800")
-                cfg.time_zone = values.get("time_zone", "").strip() or "America/Edmonton"
-                cfg.shortwave_languages = values.get("shortwave_languages", "").strip() or "E"
-                cfg.shortwave_highlight_target = values.get("shortwave_highlight_target", "").strip() or "North America"
-                cfg.shortwave_highlight_color = values.get("shortwave_highlight_color", "").strip() or "cyan"
-                cfg.shortwave_broadcast_bands_only = _coerce_bool(values.get("shortwave_broadcast_bands_only", "true"), True)
-                save_config(cfg)
-                apply_config_runtime(cfg, state)
-                state.status_line = "Settings saved and applied"
-            except Exception as e:
-                state.status_line = f"Settings save failed: {e}"
-            state.dirty_status = True
-            curses.curs_set(0)
-            stdscr.timeout(100)
-            return
-        elif k in (curses.KEY_ENTER, 10, 13):
-            label, attr = fields[idx]
-            s = _input_box(stdscr, y0 + h - 3, x0, w, f"{label}: ", values.get(attr, ""))
-            if s is not None:
-                values[attr] = s
 
 def _load_asciiworld_module():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -2597,6 +3215,56 @@ def box_title(win, title: str):
     safe_addstr(win, 0, 2, f" {title} ")
 
 
+KEY_HINT = " ? or F1 = Help   Esc = Menu "
+
+
+def draw_key_hint(win, hint: str = KEY_HINT) -> None:
+    """Write the key hint into the bottom-right of a panel's border."""
+    try:
+        h, w = win.getmaxyx()
+    except Exception:
+        return
+    if h < 3 or w < 12:
+        return
+    text = hint if len(hint) <= w - 4 else " ? = Help "
+    if len(text) > w - 4:
+        return
+    safe_addstr(win, h - 1, w - 2 - len(text), text, curses.A_BOLD)
+
+
+# Function keys some terminals send that curses may not recognise for the
+# current TERM. PuTTY's default keyboard mode sends ESC [ 1 1 ~ for F1.
+_ESC_TAIL_F1 = ("[11~", "OP", "[[A")
+
+
+def read_escape_tail(win) -> str:
+    """After getch() returned a bare Esc, collect any bytes that followed it.
+
+    Returns "" for a real Esc key press, or the rest of an escape sequence
+    curses didn't decode (e.g. "[11~" for F1 from PuTTY).
+    """
+    tail = []
+    try:
+        win.nodelay(True)
+        while len(tail) < 8:
+            ch = win.getch()
+            if ch == -1:
+                break
+            if 0 <= ch < 256:
+                tail.append(chr(ch))
+            else:
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            win.nodelay(False)
+            win.timeout(100)
+        except Exception:
+            pass
+    return "".join(tail)
+
+
 def clear_interior(win):
     h, w = win.getmaxyx()
     blank = " " * max(1, w - 2)
@@ -2607,15 +3275,13 @@ def clear_interior(win):
 def _fetch_url(url: str, timeout: float = 10.0) -> str:
     """Fetch a URL with sensible TLS handling.
 
-    Primary attempt uses the system trust store (normal certificate verification).
-    If verification fails, we can optionally fall back to an unverified context to
-    keep the clock running.
+    Certificates are always verified against the system trust store. If
+    verification fails the error is raised (and shown in the panel) rather than
+    silently retrying without checks.
 
-    Control:
-      - Set environment variable MYHAMCLOCK_INSECURE_SSL=1 to always skip TLS verification.
-      - Otherwise, we only fall back to unverified on common TLS verification failures.
-
-    Note: Skipping verification is less secure; prefer fixing Windows/Python CA certs.
+    If you really need to skip verification (e.g. an old Windows Python with a
+    broken CA bundle), set MYHAMCLOCK_INSECURE_SSL=1. On Linux/Raspberry Pi,
+    fix it with `sudo apt install --reinstall ca-certificates` instead.
     """
     req = urllib.request.Request(url, headers={"User-Agent": "MyHamClock/1.0"})
 
@@ -2633,27 +3299,9 @@ def _fetch_url(url: str, timeout: float = 10.0) -> str:
     try:
         return _read()
     except Exception as e:
-        # urllib wraps SSL errors in URLError, but sometimes raw SSLError bubbles up.
         reason = getattr(e, "reason", None)
-
-        tls_error = isinstance(e, ssl.SSLError) or isinstance(reason, ssl.SSLError)
-        if not tls_error:
-            raise
-
-        # Only fall back for verification / chain / hostname issues (common on Windows when CA bundle is missing/outdated).
-        msg = str(reason or e).lower()
-        fallback_markers = (
-            "certificate verify failed",
-            "certIFICATE_VERIFY_FAILED".lower(),
-            "self signed",
-            "unknown ca",
-            "unable to get local issuer",
-            "hostname",
-        )
-        if any(s in msg for s in fallback_markers) and url.lower().startswith("https://"):
-            ctx = ssl._create_unverified_context()
-            return _read(context=ctx)
-
+        if isinstance(e, ssl.SSLError) or isinstance(reason, ssl.SSLError):
+            _log_exception(f"TLS verification failed for {url} (set MYHAMCLOCK_INSECURE_SSL=1 to bypass)", e)
         raise
 
 
@@ -2879,8 +3527,8 @@ def resolve_wx_latlon(cfg: AppConfig):
     if grid:
         try:
             return maidenhead_to_latlon(grid)
-        except Exception:
-            pass
+        except Exception as e:
+            _log_exception("resolve_wx_latlon: invalid grid square", e)
     lat = getattr(cfg, "latitude_decimal", None)
     lon = getattr(cfg, "longitude_decimal", None)
     if lat is not None and lon is not None:
@@ -3005,15 +3653,70 @@ def update_weather_open_meteo(cfg: AppConfig, state: AppState):
 
 
 
+_TZ_CACHE: dict = {}
+
+
+def _configured_tz(cfg: Optional[AppConfig]):
+    """Return a tzinfo for cfg.time_zone, or None to fall back to system local time."""
+    name = str(getattr(cfg, "time_zone", "") or "").strip() if cfg is not None else ""
+    if not name or ZoneInfo is None:
+        return None
+    if name not in _TZ_CACHE:
+        try:
+            _TZ_CACHE[name] = ZoneInfo(name)
+        except Exception as e:
+            _debug_log(f"invalid time_zone {name!r}, using system local time: {e}")
+            _TZ_CACHE[name] = None
+    return _TZ_CACHE[name]
+
+
 def update_time_lines(state: AppState):
     # 24-hour clock only, time-of-day (no date)
-    local = time.strftime("%H:%M:%S")
-    utc = time.strftime("%H:%M:%S", time.gmtime())
+    now_utc = datetime.now(timezone.utc)
+    tz = _configured_tz(getattr(state, "cfg", None))
+    local_dt = now_utc.astimezone(tz) if tz is not None else now_utc.astimezone()
     state.wx_time_lines = [
-        f"Local:  {local}",
-        f"UTC:    {utc}",
+        f"Local:  {local_dt.strftime('%H:%M:%S %Z')}",
+        f"UTC:    {now_utc.strftime('%H:%M:%S')}",
     ]
     state.dirty_wx_time = True
+
+
+def data_refresh_worker(cfg: AppConfig, state: AppState) -> None:
+    """Fetch space weather and local weather on their own timers, off the UI thread.
+
+    state.data_refresh_event.set() forces an immediate refetch (e.g. after saving settings).
+    """
+    last_space = 0.0
+    last_wx = 0.0
+    while state.running:
+        forced = state.data_refresh_event.is_set()
+        state.data_refresh_event.clear()
+        now = time.time()
+        try:
+            space_every = float(getattr(cfg, "refresh_seconds", 1800.0) or 1800.0)
+        except Exception:
+            space_every = 1800.0
+        try:
+            wx_every = float(getattr(cfg, "local_weather_refresh_sec", 1800.0) or 1800.0)
+        except Exception:
+            wx_every = 1800.0
+
+        if forced or (now - last_space) >= space_every:
+            try:
+                update_space_weather(state, panel_inner_w=state.space_inner_w)
+            except Exception as e:
+                _log_exception("data_refresh_worker space weather", e)
+            last_space = time.time()
+
+        if forced or (now - last_wx) >= wx_every:
+            try:
+                update_weather_open_meteo(cfg, state)
+            except Exception as e:
+                _log_exception("data_refresh_worker local weather", e)
+            last_wx = time.time()
+
+        state.data_refresh_event.wait(5.0)
 
 
 def strip_dx_prefix(line: str) -> str:
@@ -3585,7 +4288,7 @@ def _mysql_upsert_hamcall_calls_from_qrz(conn, info: dict) -> None:
     if exists:
         set_cols = [c for c in ordered_cols if c.lower() != "callsign"]
         if set_cols:
-            sql = f"UPDATE hamcall_calls SET " + ", ".join(f"{c}={ph}" for c in set_cols) + f" WHERE UPPER(callsign)=UPPER({ph})"
+            sql = "UPDATE hamcall_calls SET " + ", ".join(f"{c}={ph}" for c in set_cols) + f" WHERE UPPER(callsign)=UPPER({ph})"
             params = [insertable[c] for c in set_cols] + [callsign]
             cur.execute(sql, params)
             conn.commit()
@@ -4113,56 +4816,6 @@ def _lookup_callsign_local_first(callsign: str, cfg: Optional[AppConfig] = None)
 
 
 
-def lookup_callsign_info(callsign: str) -> dict:
-    callsign = _normalize_callsign(callsign)
-    if not callsign:
-        return {"callsign": "", "name": "", "city": "", "prov_state": "", "country": "", "source": "not found"}
-
-    local_result, db_path = _lookup_callsign_local_first(callsign, cfg if 'cfg' in locals() else None)
-    if local_result:
-        return local_result
-
-    module = _load_callsign_lookup_module()
-    try:
-        if module is not None and hasattr(module, "lookup_hamqth"):
-            hamqth_raw = module.lookup_hamqth(callsign)
-        else:
-            hamqth_raw = _lookup_hamqth_local(callsign)
-
-        result = _normalize_lookup_result(hamqth_raw, "hamqth", callsign)
-        if result:
-            _debug_log(f"lookup source=online provider=hamqth.com callsign={callsign!r}")
-            try:
-                merged = dict(hamqth_raw or {})
-                merged.setdefault("callsign", result.get("callsign"))
-                merged.setdefault("name", result.get("name"))
-                merged.setdefault("city", result.get("city"))
-                merged.setdefault("prov_state", result.get("prov_state"))
-                merged.setdefault("country", result.get("country"))
-                if _db_is_mysql_cfg():
-                    cfg2 = load_config()
-                    with _mysql_connect_cfg(cfg2) as conn:
-                        _cache_online_result_in_calls(conn, merged, "hamqth.com")
-                else:
-                    with sqlite3.connect(db_path) as conn:
-                        _cache_online_result_in_calls(conn, merged, "hamqth.com")
-            except Exception as e:
-                _debug_log(f"lookup cache write failed provider='hamqth.com' callsign={callsign!r} db={db_path!r}: {e}")
-            return result
-    except Exception as e:
-        _debug_log(f"lookup error source=online provider='hamqth.com' callsign={callsign!r}: {e}")
-
-    _debug_log(f"lookup source=not_found callsign={callsign!r}")
-    return {
-        "callsign": callsign,
-        "name": "",
-        "city": "",
-        "prov_state": "",
-        "country": "",
-        "source": "not found",
-    }
-
-
 def _callsign_lookup_cache_path(filename: str) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, filename)
@@ -4177,8 +4830,10 @@ def _load_cached_session(cache_file: str, max_age: int) -> str:
         saved_at = float(data.get("saved_at", 0))
         if session_id and (time.time() - saved_at) < float(max_age):
             return session_id
-    except Exception:
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        _log_exception("_load_cached_session", e)
     return ""
 
 
@@ -4337,6 +4992,54 @@ def _save_hamqth_cached_session(session_id: str) -> None:
 
 def _clear_hamqth_cached_session() -> None:
     _clear_cached_session(HAMQTH_CACHE_FILE)
+
+
+def _fetch_hamqth_xml(params: dict) -> bytes:
+    url = HAMQTH_URL + "?" + urllib.parse.urlencode(params)
+    # HamQTH sends the password as "p=", which the generic masker doesn't catch.
+    safe_url = re.sub(r'([?&]p=)[^&]*', r'\1***', _mask_sensitive_text(url))
+    _debug_log(f"_fetch_hamqth_xml request: {safe_url}")
+    data = _fetch_xml_url(url)
+    try:
+        preview = data.decode("utf-8", errors="replace")
+        _debug_log(f"_fetch_hamqth_xml response: {_truncate_for_log(preview, 2000)}")
+    except Exception as exc:
+        _log_exception("_fetch_hamqth_xml response logging failed", exc)
+    return data
+
+
+def _xml_text(root: ET.Element, path: str, default: str = "") -> str:
+    """Return stripped text for a HamQTH path like './/hq:search/hq:callsign'.
+
+    Tries the HamQTH namespace first, then falls back to matching tag names
+    without namespaces in case the server changes or drops its xmlns.
+    """
+    if root is None:
+        return default
+    try:
+        node = root.find(path, HAMQTH_NS)
+        if node is not None and node.text:
+            return node.text.strip()
+    except Exception:
+        pass
+    parts = [p.split(":", 1)[-1] for p in path.replace(".//", "").split("/") if p and p != "."]
+    if not parts:
+        return default
+
+    def _local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    for start in root.iter():
+        if _local(start.tag) != parts[0]:
+            continue
+        node = start
+        for part in parts[1:]:
+            node = next((c for c in node if _local(c.tag) == part), None)
+            if node is None:
+                break
+        if node is not None and node.text and node.text.strip():
+            return node.text.strip()
+    return default
 
 
 def _get_hamqth_session_id_cfg(cfg: AppConfig) -> str:
@@ -4964,7 +5667,16 @@ def _dedx_field(label: str, value: str, width: int) -> str:
 
 
 def build_dedx_lines(state: AppState, width: int, height: int) -> List[str]:
-    if state.dedx_lines:
+    info = getattr(state, "dedx_spot_info", None)
+    if info:
+        # Use the roomiest layout that still shows both DE and DX.
+        de_info, dx_info = info
+        lines = _dedx_layout_full(de_info, dx_info)
+        if len(lines) > height:
+            lines = _dedx_layout_medium(de_info, dx_info)
+        if len(lines) > height:
+            lines = _dedx_layout_compact(de_info, dx_info)
+    elif state.dedx_lines:
         lines = list(state.dedx_lines)
     else:
         lines = [
@@ -5189,18 +5901,6 @@ def draw_dx_cluster_panel(win, state: AppState) -> None:
     win.noutrefresh()
 
 
-def build_rig_lines(state: AppState, width: int, height: int) -> List[str]:
-    lines = [
-        f"Freq: {getattr(state, 'rig_frequency', '14.074.00')}",
-        f"Mode: {getattr(state, 'rig_mode', 'USB')}",
-    ]
-
-    usable_h = max(1, height)
-    if len(lines) < usable_h:
-        lines.extend([""] * (usable_h - len(lines)))
-    return [line[:max(1, width)] for line in lines[:usable_h]]
-
-
 def update_dedx_panel_from_spot(cfg: AppConfig, state: AppState, raw_text: str) -> None:
     spot = parse_dx_cluster_spot(raw_text)
     if not spot:
@@ -5209,8 +5909,13 @@ def update_dedx_panel_from_spot(cfg: AppConfig, state: AppState, raw_text: str) 
     de_info = get_cached_callsign_info(cfg, state, spot["spotter"])
     dx_info = get_cached_callsign_info(cfg, state, spot["spotted"])
 
-    lines = []
+    state.dedx_spot_info = (dict(de_info or {}), dict(dx_info or {}))
+    state.dedx_lines = _dedx_layout_full(de_info or {}, dx_info or {})
+    state.dirty_dedx = True
 
+
+def _dedx_layout_full(de_info: dict, dx_info: dict) -> List[str]:
+    lines: List[str] = []
     for heading, info in (("DE", de_info), ("DX", dx_info)):
         lines.extend([
             "",
@@ -5222,19 +5927,97 @@ def update_dedx_panel_from_spot(cfg: AppConfig, state: AppState, raw_text: str) 
             _dedx_field("Country", info.get("country", ""), 999),
             _dedx_field("DB", info.get("source", ""), 999),
         ])
+    return lines
 
-    state.dedx_lines = lines
-    state.dirty_dedx = True
+
+def _dedx_layout_medium(de_info: dict, dx_info: dict) -> List[str]:
+    # 13 lines: callsign on the heading line, no leading blanks
+    lines: List[str] = []
+    for heading, info in (("DE", de_info), ("DX", dx_info)):
+        if lines:
+            lines.append("")
+        call = _clean_lookup_value(info.get("callsign", "")) or "-"
+        lines.extend([
+            f"{heading}: {call}",
+            _dedx_field("Name", info.get("name", ""), 999),
+            _dedx_field("City", info.get("city", ""), 999),
+            _dedx_field("Prov/St", info.get("prov_state", ""), 999),
+            _dedx_field("Country", info.get("country", ""), 999),
+            _dedx_field("DB", info.get("source", ""), 999),
+        ])
+    return lines
+
+
+def _dedx_layout_compact(de_info: dict, dx_info: dict) -> List[str]:
+    # 9 lines: city and prov/state share a line, source goes on the heading
+    lines: List[str] = []
+    for heading, info in (("DE", de_info), ("DX", dx_info)):
+        if lines:
+            lines.append("")
+        call = _clean_lookup_value(info.get("callsign", "")) or "-"
+        src = _clean_lookup_value(info.get("source", ""))
+        qth = ", ".join(p for p in (_clean_lookup_value(info.get("city", "")),
+                                    _clean_lookup_value(info.get("prov_state", ""))) if p)
+        lines.extend([
+            f"{heading}: {call}" + (f"  [{src}]" if src else ""),
+            _dedx_field("Name", info.get("name", ""), 999),
+            _dedx_field("QTH", qth, 999),
+            _dedx_field("Country", info.get("country", ""), 999),
+        ])
+    return lines
+
+
+def dedx_lookup_worker(cfg: AppConfig, state: AppState) -> None:
+    """Look up DE/DX callsigns for the newest spot. Older queued spots are
+    skipped, since the panel only ever shows the latest one."""
+    while state.running:
+        try:
+            raw_text = state.dedx_spot_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        while True:
+            try:
+                raw_text = state.dedx_spot_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            update_dedx_panel_from_spot(cfg, state, raw_text)
+        except Exception as e:
+            _log_exception("dedx_lookup_worker", e)
+        state.dirty_dedx = True
+
+
+def _dx_cluster_target(cfg: AppConfig) -> Tuple[str, int, str, str, str]:
+    try:
+        port = int(getattr(cfg, "dx_cluster_port", 7300) or 7300)
+    except Exception:
+        port = 7300
+    return (
+        str(getattr(cfg, "dx_cluster_host", "") or "").strip(),
+        port,
+        str(getattr(cfg, "dx_cluster_username", "") or "").strip(),
+        str(getattr(cfg, "dx_cluster_password", "") or "").strip(),
+        str(getattr(cfg, "dx_filter", "") or "").strip(),
+    )
 
 
 def dx_cluster_worker(cfg: AppConfig, state: AppState):
 
     while state.running:
+        target = _dx_cluster_target(cfg)
+        dx_host, dx_port, dx_user, dx_pass, dx_filter = target
+        if not dx_host:
+            state.dx_cluster_ready = False
+            if state.dx_status_line != "DX: not configured (Esc > DX Cluster)":
+                state.dx_status_line = "DX: not configured (Esc > DX Cluster)"
+                state.dirty_status = True
+            time.sleep(2)
+            continue
         try:
             state.dx_cluster_ready = False
-            state.dx_status_line = f"DX: connecting {cfg.dx_host}:{cfg.dx_port}..."
+            state.dx_status_line = f"DX: connecting {dx_host}:{dx_port}..."
             state.dirty_status = True
-            with socket.create_connection((cfg.dx_host, cfg.dx_port), timeout=10) as s:
+            with socket.create_connection((dx_host, dx_port), timeout=10) as s:
                 s.settimeout(2.0)
 
                 t0 = time.time()
@@ -5246,24 +6029,27 @@ def dx_cluster_worker(cfg: AppConfig, state: AppState):
                     except socket.timeout:
                         continue
 
-                if str(cfg.dx_user).strip():
-                    s.sendall((str(cfg.dx_user).strip() + "\n").encode("utf-8", errors="ignore"))
+                if dx_user:
+                    s.sendall((dx_user + "\n").encode("utf-8", errors="ignore"))
                     time.sleep(0.2)
-                if str(cfg.dx_pass).strip():
-                    s.sendall((str(cfg.dx_pass).strip() + "\n").encode("utf-8", errors="ignore"))
+                if dx_pass:
+                    s.sendall((dx_pass + "\n").encode("utf-8", errors="ignore"))
                     time.sleep(0.3)
 
-                if cfg.dx_filter.strip():
-                    s.sendall((cfg.dx_filter.strip() + "\n").encode("utf-8", errors="ignore"))
+                if dx_filter:
+                    s.sendall((dx_filter + "\n").encode("utf-8", errors="ignore"))
                     time.sleep(0.2)
 
                 state.dx_cluster_ready = True
-                state.dx_status_line = f"DX: connected {cfg.dx_host}:{cfg.dx_port}"
+                state.dx_status_line = f"DX: connected {dx_host}:{dx_port}"
                 state.dirty_status = True
                 s.settimeout(0.5)
 
                 linebuf = b""
                 while state.running:
+                    if _dx_cluster_target(cfg) != target:
+                        # DX Cluster settings were saved; reconnect with the new ones.
+                        break
                     try:
                         while True:
                             try:
@@ -5290,7 +6076,7 @@ def dx_cluster_worker(cfg: AppConfig, state: AppState):
 
                             if raw_text.lstrip().upper().startswith("DX DE "):
                                 status_spot = " ".join((raw_text or "").split())
-                                state.dx_status_line = f"DX: connected {cfg.dx_host}:{cfg.dx_port} | {status_spot}"
+                                state.dx_status_line = f"DX: connected {dx_host}:{dx_port} | {status_spot}"
                                 state.dirty_status = True
 
                                 parsed = parse_dx_cluster_spot(raw_text)
@@ -5305,8 +6091,9 @@ def dx_cluster_worker(cfg: AppConfig, state: AppState):
                                         if state.dx_auto_follow or state.dx_selected_idx < 0:
                                             state.dx_selected_idx = len(state.dx_spots) - 1
 
-                                    update_dedx_panel_from_spot(cfg, state, raw_text)
-                                    state.dirty_dedx = True
+                                    # Callsign lookups can take seconds online; hand them
+                                    # to dedx_lookup_worker so spot reading never stalls.
+                                    state.dedx_spot_queue.put(raw_text)
 
                             state.dirty_dx = True
                     except socket.timeout:
@@ -5750,7 +6537,6 @@ def _append_builtin_regional_am_rows(rows):
             continue
         target_text = str(item.get("target", "") or "").strip()
         tx_display = str(item.get("tx_display", "") or "").strip()
-        note = str(item.get("note", "") or "").strip()
         rows.append({
             "frequency_khz": float(item["frequency_khz"]),
             "frequency_text": f"{int(item['frequency_khz'])}" if float(item["frequency_khz"]).is_integer() else f"{item['frequency_khz']}",
@@ -6140,13 +6926,13 @@ def draw_shortwave_panel(win, state: AppState) -> None:
 
 
 def show_help_screen(stdscr, state: AppState):
-    """Show keyboard help. Close with F1 or Esc."""
+    """Show keyboard help. Close with F1, ?, q or Esc."""
     lines = [
-        "F1 = Close help",
-        "Esc = Close help",
+        "F1, ?, Q or Esc = Close help",
+        "Up/Down, PgUp/PgDn = Scroll",
         "",
         "Main screen",
-        "  F1 = Show this help screen",
+        "  ? or F1 = Show this help screen",
         "  Esc = Open the File menu",
         "  L = Toggle Logbook mode on/off",
         "  S = Toggle Shortwave Radio panel",
@@ -6162,7 +6948,16 @@ def show_help_screen(stdscr, state: AppState):
         "  C = Manage/select station callsigns",
         "  E = Edit selected QSO",
         "  D = Delete selected QSO",
+        "  I = Import ADIF log (.adi, or a .zip with one in it)",
+        "  X = Export ADIF log",
         "  Up/Down = Select recent QSO",
+        "",
+        "Station callsigns (C in Logbook mode)",
+        "  Use / Add / Edit / Delete / Set default",
+        "",
+        "Text boxes",
+        "  Enter = OK   Esc = Cancel",
+        "  Left/Right/Home/End = Move   Ctrl-U = Clear",
         "",
         "File menu",
         "  Up/Down = Move through menu items",
@@ -6220,7 +7015,10 @@ def show_help_screen(stdscr, state: AppState):
         win.refresh()
         k = win.getch()
 
-        if k in (curses.KEY_F1, 27):
+        if k == 27:
+            read_escape_tail(win)  # swallow the rest of PuTTY's F1, if that's what it was
+            break
+        if k in (curses.KEY_F1, ord('?'), ord('q'), ord('Q')):
             break
         elif k == curses.KEY_UP:
             top = max(0, top - 1)
@@ -6370,15 +7168,10 @@ def edit_mysql_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
             shown = "*" * len(str(inp)) if attr == "mysql_password" and inp else str(inp)
             safe_addstr(win2, 1, min(w - 3, 2 + len(prompt)), shown[: max(0, w - (4 + len(prompt)))])
             win2.refresh()
-            curses.echo()
-            try:
-                s = win2.getstr(1, 2 + len(prompt), max(1, w - (4 + len(prompt)))).decode("utf-8", errors="ignore")
-                if s is not None:
-                    values[attr] = s
-            except Exception:
-                pass
-            finally:
-                curses.noecho()
+            s = _read_line(win2, 1, 2 + len(prompt), max(1, w - (4 + len(prompt))), str(inp),
+                           mask=(attr == "mysql_password"))
+            if s is not None:
+                values[attr] = s
 
     curses.curs_set(0)
     stdscr.timeout(100)
@@ -6449,7 +7242,7 @@ def edit_settings_dialog(stdscr, cfg: AppConfig, state: AppState):
                 cfg.grid_square = values.get("grid_square", "").strip()
                 cfg.local_weather_refresh_sec = float(values.get("local_weather_refresh_sec", "1800") or "1800")
                 cfg.time_zone = values.get("time_zone", "").strip() or "America/Edmonton"
-                cfg.shortwave_languages = values.get("shortwave_languages", "").strip() or "E"
+                # Shortwave options are edited in Esc > Shortwave, not here.
                 save_config(cfg)
                 apply_config_runtime(cfg, state)
                 state.status_line = "Settings saved and applied"
@@ -6593,15 +7386,10 @@ def edit_online_lookup_dialog(stdscr, cfg: AppConfig, state: AppState):
             win2.box()
             safe_addstr(win2, 1, 2, prompt)
             win2.refresh()
-            curses.echo()
-            try:
-                s = win2.getstr(1, 2 + len(prompt), w - (4 + len(prompt))).decode("utf-8", errors="ignore")
-                if s is not None:
-                    values[attr] = s
-            except Exception:
-                pass
-            finally:
-                curses.noecho()
+            s = _read_line(win2, 1, 2 + len(prompt), max(1, w - (4 + len(prompt))),
+                           str(values.get(attr, "") or ""), mask=("password" in attr))
+            if s is not None:
+                values[attr] = s
 
 
 
@@ -6624,21 +7412,11 @@ def callsign_lookup_dialog(stdscr, cfg: AppConfig, state: AppState):
     safe_addstr(win, 2, 2, prompt)
     win.refresh()
 
-    curses.curs_set(1)
     stdscr.nodelay(False)
-    curses.echo()
-    entered = ""
-    try:
-        raw = win.getstr(2, 2 + len(prompt), max(1, w - (4 + len(prompt))))
-        if raw is None:
-            return
-        entered = raw.decode("utf-8", errors="ignore").strip()
-    except Exception:
-        entered = ""
-    finally:
-        curses.noecho()
-        curses.curs_set(0)
-        stdscr.timeout(100)
+    raw = _read_line(win, 2, 2 + len(prompt), max(1, w - (4 + len(prompt))))
+    curses.curs_set(0)
+    stdscr.timeout(100)
+    entered = (raw or "").strip()   # Esc (None) behaves like an empty entry
 
     try:
         win.erase()
@@ -6738,11 +7516,8 @@ def dx_command_dialog(stdscr, state: AppState):
     safe_addstr(win, 3, 2, "Enter=Send   ESC=Cancel")
     win.refresh()
 
-    curses.curs_set(1)
-    curses.echo()
     try:
-        # Read input
-        s = win.getstr(2, 2 + len(prompt), w - (4 + len(prompt))).decode("utf-8", errors="ignore")
+        s = _read_line(win, 2, 2 + len(prompt), max(1, w - (4 + len(prompt))))
         if s is None:
             return
         cmd = s.strip()
@@ -6750,11 +7525,7 @@ def dx_command_dialog(stdscr, state: AppState):
             state.dx_cmd_queue.put(cmd)
             state.status_line = f"DX cmd queued: {cmd}"
             state.dirty_status = True
-    except Exception:
-        # ignore
-        pass
     finally:
-        curses.noecho()
         curses.curs_set(0)
         stdscr.timeout(100)
 
@@ -6775,18 +7546,20 @@ def draw_box_contents(win, lines: List[str], title: Optional[str] = None):
 def build_rig_lines(state: AppState, width: int, height: int) -> List[str]:
     freq = str(getattr(state, "rig_frequency", "-") or "-")
     mode = str(getattr(state, "rig_mode", "-") or "-")
-    comp = bool(getattr(state, "rig_comp", False))
-    preamp = str(getattr(state, "rig_preamp", "Off") or "Off")
+    comp = getattr(state, "rig_comp", None)
+    preamp = str(getattr(state, "rig_preamp", "-") or "-")
     agc = str(getattr(state, "rig_agc", "-") or "-")
-    nb = bool(getattr(state, "rig_nb", False))
-    nr = bool(getattr(state, "rig_nr", False))
+    nb = getattr(state, "rig_nb", None)
+    nr = getattr(state, "rig_nr", None)
 
+    # The labels (COMP/NB/NR) are re-drawn bright or dim by the main loop;
+    # "-" means the radio doesn't report that function.
     line1 = f"Freq: {freq}"
     line2 = f"Mode: {mode}"
-    line3 = f"Comp: {'COMP' if comp else 'comp'}"
+    line3 = f"Comp: {'COMP' if comp is not None else '-'}"
     line4 = f"Pre-Amp: {preamp}"
     line5 = f"AGC: {agc}"
-    line6 = f"NB: {'NB' if nb else 'nb'}    NR: {'NR' if nr else 'nr'}"
+    line6 = f"NB: {'NB' if nb is not None else '-'}    NR: {'NR' if nr is not None else '-'}"
 
     lines = [line1, line2, line3, line4, line5, line6]
     while len(lines) < height:
@@ -6881,7 +7654,7 @@ def _is_dx_enter_key(k: int) -> bool:
 def main(stdscr):
     config_exists = os.path.exists(CONFIG_FILE)
     cfg = load_config()
-    set_logging_enabled(getattr(cfg, "enable_logging", True))
+    set_logging_enabled(getattr(cfg, "enable_logging", False))
     state = AppState()
     state.cfg = cfg
     state.rig_frequency = "-"
@@ -6899,7 +7672,9 @@ def main(stdscr):
         cfg = load_config()
         state.cfg = cfg
 
-    initialize_online_lookup_session(cfg, state)
+    # QRZ/HamQTH login can take a few seconds; don't hold up the first screen.
+    threading.Thread(target=initialize_online_lookup_session, args=(cfg, state), daemon=True,
+                     name="initialize_online_lookup_session").start()
 
     # Enable curses color support (used for ANSI->curses map rendering)
     if curses.has_colors():
@@ -6947,11 +7722,16 @@ def main(stdscr):
         dedx_w = max(20, maxx // 3)
         map_w = max(20, maxx - dedx_w)
 
-        rig_h = min(6, map_h)
+        # With rig control off, the DE / DX panel takes the Radio box's rows.
+        state.layout_rig_enabled = bool(getattr(cfg, "rig_control_enabled", False))
+        if state.layout_rig_enabled:
+            rig_h = min(6, map_h)
+            w_rig = curses.newwin(rig_h, dedx_w, map_start_y, 0)
+            box_title(w_rig, "Radio")
+        else:
+            rig_h = 0
+            w_rig = None
         dedx_h = max(3, map_h - rig_h)
-
-        w_rig = curses.newwin(rig_h, dedx_w, map_start_y, 0)
-        box_title(w_rig, "Radio")
 
         w_dedx = curses.newwin(dedx_h, dedx_w, map_start_y + rig_h, 0)
         box_title(w_dedx, "DE / DX")
@@ -6980,36 +7760,38 @@ def main(stdscr):
             return 0
 
     space_inner_w = _space_inner_w()
+    state.space_inner_w = space_inner_w
 
-    # Start DX thread
-    t = threading.Thread(target=dx_cluster_worker, args=(cfg, state), daemon=True)
-    t.start()
+    if not state.space_weather_lines:
+        state.space_weather_lines = ["Loading space weather..."]
+    if not state.wx_static_lines:
+        state.wx_static_lines = ["Loading local weather..."]
 
-    # Initial data
-    update_space_weather(state, panel_inner_w=space_inner_w)
-    update_weather_open_meteo(cfg, state)
+    # Background threads: network and radio I/O never run on the UI thread,
+    # so a slow website or missing rigctld can't stop the clock.
+    for target in (dx_cluster_worker, dedx_lookup_worker, data_refresh_worker, rig_poll_worker):
+        threading.Thread(target=target, args=(cfg, state), daemon=True, name=target.__name__).start()
+
     update_time_lines(state)
     refresh_shortwave_view(cfg, state)
 
-    last_refresh = 0.0
-    last_wx_refresh = 0.0
     last_map_refresh = 0.0
     last_time_refresh = 0.0
-    last_rig_refresh = 0.0
     last_shortwave_refresh = 0.0
 
     while state.running:
         now = time.time()
 
+        # Rig control switched on/off in Esc > Rig Control: rebuild the layout.
+        if bool(getattr(cfg, "rig_control_enabled", False)) != state.layout_rig_enabled:
+            stdscr.erase()
+            stdscr.noutrefresh()
+            w_space, w_dx, w_wx, w_rig, w_dedx, w_map = build_windows()
+            state.dirty_logbook = True
+
         # DX spot map overlay disabled: leave base world map rendering unchanged.
 
-        # periodic updates (paused when menu is open)
-        if (now - last_refresh) >= cfg.refresh_seconds:
-            update_space_weather(state, panel_inner_w=space_inner_w)
-            if (now - last_wx_refresh) >= cfg.local_weather_refresh_sec:
-                update_weather_open_meteo(cfg, state)
-                last_wx_refresh = now
-            last_refresh = now
+        # Space weather, local weather and rig polling run in background threads.
 
         # World map refresh (every cfg.map_refresh_seconds)
         if (not state.logging_mode) and (now - last_map_refresh) >= cfg.map_refresh_seconds:
@@ -7020,20 +7802,20 @@ def main(stdscr):
             update_time_lines(state)
             last_time_refresh = now
 
-        try:
-            rig_poll_sec = max(0.2, float(getattr(cfg, "rigctld_poll_ms", 1000) or 1000) / 1000.0)
-        except Exception:
-            rig_poll_sec = 1.0
-        if (now - last_rig_refresh) >= rig_poll_sec:
-            poll_rigctld_once(cfg, state)
-            last_rig_refresh = now
-
         if state.shortwave_mode and (now - last_shortwave_refresh) >= 900.0:
             refresh_shortwave_view(cfg, state)
             last_shortwave_refresh = now
 
         # input
         k = stdscr.getch()
+        if k == 27:
+            tail = read_escape_tail(stdscr)
+            if tail in _ESC_TAIL_F1:
+                k = curses.KEY_F1
+            elif tail:
+                k = -1  # some other unrecognised key; don't treat it as Esc
+        if k == ord('?'):
+            k = curses.KEY_F1
         if k is not None and k != -1:
             if k == curses.KEY_RESIZE:
                 stdscr.erase()
@@ -7041,6 +7823,7 @@ def main(stdscr):
                 w_space, w_dx, w_wx, w_rig, w_dedx, w_map = build_windows()
 
                 space_inner_w = _space_inner_w()
+                state.space_inner_w = space_inner_w
 
                 state.dirty_dx = True
                 state.dirty_wx_static = True
@@ -7052,24 +7835,13 @@ def main(stdscr):
                 state.dirty_status = True
             elif k == curses.KEY_F1:
                 show_help_screen(stdscr, state)
-                now = time.time()
-                last_refresh = now
-                last_wx_refresh = now
-                last_map_refresh = now
-                last_time_refresh = now
-                update_space_weather(state, panel_inner_w=space_inner_w)
-                update_weather_open_meteo(cfg, state)
+                # Data is refreshed in the background; a settings save triggers a refetch.
+                force_full_redraw(stdscr, state)
                 update_time_lines(state)
             elif k == 27:
                 file_menu_dialog(stdscr, cfg, state)
                 force_full_redraw(stdscr, state)
-                now = time.time()
-                last_refresh = now
-                last_wx_refresh = now
-                last_map_refresh = now
-                last_time_refresh = now
-                update_space_weather(state, panel_inner_w=space_inner_w)
-                update_weather_open_meteo(cfg, state)
+                # Data is refreshed in the background; a settings save triggers a refetch.
                 update_time_lines(state)
             elif k in (ord('s'), ord('S')):
                 state.shortwave_mode = not state.shortwave_mode
@@ -7120,13 +7892,7 @@ def main(stdscr):
                         else:
                             qso_entry_dialog(stdscr, cfg, state, None)
                             force_full_redraw(stdscr, state)
-                            now = time.time()
-                            last_refresh = now
-                            last_wx_refresh = now
-                            last_map_refresh = now
-                            last_time_refresh = now
-                            update_space_weather(state, panel_inner_w=space_inner_w)
-                            update_weather_open_meteo(cfg, state)
+                            # Data is refreshed in the background; a settings save triggers a refetch.
                             update_time_lines(state)
                     except Exception as e:
                         _simple_message_popup(stdscr, "Logbook", str(e))
@@ -7142,19 +7908,23 @@ def main(stdscr):
                         _simple_message_popup(stdscr, "Callsign", str(e))
                         state.status_line = f"Callsign error: {e}"
                         state.dirty_status = True
+            elif k in (ord('I'), ord('i'), ord('X'), ord('x')):
+                if state.logging_mode:
+                    try:
+                        if k in (ord('I'), ord('i')):
+                            adif_import_dialog(stdscr, cfg, state)
+                        else:
+                            adif_export_dialog(stdscr, cfg, state)
+                    except Exception as e:
+                        _simple_message_popup(stdscr, "ADIF", str(e))
+                    force_full_redraw(stdscr, state)
             elif k in (ord('E'), ord('e')):
                 if state.logging_mode and state.logbook_recent_rows:
                     idx = max(0, min(len(state.logbook_recent_rows) - 1, int(getattr(state, 'logbook_selected_idx', 0) or 0)))
                     qso_id = int(state.logbook_recent_rows[idx]['id'])
                     qso_entry_dialog(stdscr, cfg, state, qso_id)
                     force_full_redraw(stdscr, state)
-                    now = time.time()
-                    last_refresh = now
-                    last_wx_refresh = now
-                    last_map_refresh = now
-                    last_time_refresh = now
-                    update_space_weather(state, panel_inner_w=space_inner_w)
-                    update_weather_open_meteo(cfg, state)
+                    # Data is refreshed in the background; a settings save triggers a refetch.
                     update_time_lines(state)
             elif k in (ord('D'), ord('d')):
                 if state.logging_mode:
@@ -7188,9 +7958,8 @@ def main(stdscr):
             draw_box_contents(w_space, state.space_weather_lines, "Space Weather")
             state.dirty_space = False
 
-        if state.dirty_dx:  
-            dx_visible = max(1, w_dx.getmaxyx()[0] - 2)  
-            draw_dx_cluster_panel(w_dx, state)  
+        if state.dirty_dx:
+            draw_dx_cluster_panel(w_dx, state)
             state.dirty_dx = False
 
         if state.dirty_wx_static or state.dirty_wx_time:
@@ -7200,6 +7969,8 @@ def main(stdscr):
             state.dirty_wx_static = False
             state.dirty_wx_time = False
 
+        if state.dirty_rig and w_rig is None:
+            state.dirty_rig = False
         if state.dirty_rig:
             h_rig, w_rig_inner = w_rig.getmaxyx()
             inner_w = max(1, w_rig_inner - 2)
@@ -7215,16 +7986,20 @@ def main(stdscr):
             except Exception:
                 off_attr = curses.A_DIM
 
-            comp_attr = on_attr if bool(getattr(state, "rig_comp", False)) else off_attr
-            nb_attr = on_attr if bool(getattr(state, "rig_nb", False)) else off_attr
-            nr_attr = on_attr if bool(getattr(state, "rig_nr", False)) else off_attr
+            comp = getattr(state, "rig_comp", None)
+            nb = getattr(state, "rig_nb", None)
+            nr = getattr(state, "rig_nr", None)
 
-            # Interior starts at row 1, col 1
-            if inner_h >= 3:
-                safe_addstr(w_rig, 3, 8, "COMP", comp_attr)
-            if inner_h >= 6:
-                safe_addstr(w_rig, 6, 5, "NB", nb_attr)
-                safe_addstr(w_rig, 6, 16, "NR", nr_attr)
+            # Interior starts at row 1, col 1; columns match build_rig_lines().
+            if inner_h >= 3 and comp is not None:
+                safe_addstr(w_rig, 3, 1 + len("Comp: "), "COMP", on_attr if comp else off_attr)
+            if inner_h >= 6 and len(rig_lines) >= 6:
+                line6 = rig_lines[5]
+                if nb is not None:
+                    safe_addstr(w_rig, 6, 1 + len("NB: "), "NB", on_attr if nb else off_attr)
+                nr_pos = line6.find("NR: ")
+                if nr is not None and nr_pos >= 0:
+                    safe_addstr(w_rig, 6, 1 + nr_pos + len("NR: "), "NR", on_attr if nr else off_attr)
             w_rig.noutrefresh()
             state.dirty_rig = False
 
@@ -7240,11 +8015,15 @@ def main(stdscr):
         if state.shortwave_mode:
             if state.dirty_map:
                 draw_shortwave_panel(w_map, state)
+                draw_key_hint(w_map)
+                w_map.noutrefresh()
                 state.dirty_map = False
                 state.dirty_logbook = False
         elif state.logging_mode:
             if state.dirty_map or state.dirty_logbook:
                 draw_box_contents(w_map, state.logbook_lines, "Logbook")
+                draw_key_hint(w_map)
+                w_map.noutrefresh()
                 state.dirty_map = False
                 state.dirty_logbook = False
         elif state.dirty_map:
@@ -7265,6 +8044,7 @@ def main(stdscr):
             for i in range(min(inner_h, len(lines))):
                 add_ansi_str(w_map, 1 + i, 1, lines[i], inner_w)
 
+            draw_key_hint(w_map)
             w_map.noutrefresh()
             state.dirty_map = False
 
@@ -7284,56 +8064,3 @@ if __name__ == "__main__":
     except Exception:
         import traceback
         traceback.print_exc()
-def edit_simple_fields_dialog(stdscr, title: str, cfg: AppConfig, fields: List[dict]):
-    h = max(10, len(fields) + 4)
-    w = 60
-    maxy, maxx = stdscr.getmaxyx()
-    y = max(0, (maxy - h) // 2)
-    x = max(0, (maxx - w) // 2)
-    win = curses.newwin(h, w, y, x)
-    win.keypad(True)
-    idx = 0
-    while True:
-        win.erase()
-        box_title(win, title)
-        for i, fld in enumerate(fields):
-            val = getattr(cfg, fld["attr"], "")
-            if fld["type"] == "bool":
-                disp = "Yes" if bool(val) else "No"
-            else:
-                disp = str(val)
-            prefix = ">" if i == idx else " "
-            safe_addstr(win, 1 + i, 2, f"{prefix} {fld['label']}: {disp}"[:w-4])
-        safe_addstr(win, h - 2, 2, "Enter=Edit  Space=Toggle Bool  S=Save  Esc=Cancel"[:w-4])
-        win.refresh()
-        ch = win.getch()
-        if ch in (27,):
-            break
-        elif ch in (curses.KEY_UP, ord('k')):
-            idx = (idx - 1) % len(fields)
-        elif ch in (curses.KEY_DOWN, ord('j')):
-            idx = (idx + 1) % len(fields)
-        elif ch == ord(' '):
-            fld = fields[idx]
-            if fld["type"] == "bool":
-                setattr(cfg, fld["attr"], not bool(getattr(cfg, fld["attr"], False)))
-        elif ch in (10, 13, curses.KEY_ENTER):
-            fld = fields[idx]
-            if fld["type"] != "bool":
-                curses.echo()
-                try:
-                    win.move(1 + idx, min(w - 20, len(fld["label"]) + 6))
-                    win.clrtoeol()
-                    win.refresh()
-                    raw = win.getstr(1 + idx, min(w - 20, len(fld["label"]) + 6), 30).decode("utf-8", errors="ignore")
-                finally:
-                    curses.noecho()
-                if fld["type"] == "int":
-                    try:
-                        setattr(cfg, fld["attr"], int(raw.strip()))
-                    except Exception:
-                        pass
-                else:
-                    setattr(cfg, fld["attr"], raw.strip())
-        elif ch in (ord('s'), ord('S')):
-            break

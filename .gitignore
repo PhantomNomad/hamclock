@@ -1,0 +1,27 @@
+# Your real settings hold passwords (QRZ, HamQTH, MySQL, DX cluster).
+# Copy hamclock_settings.example.json to hamclock_settings.json and edit that.
+hamclock_settings.json
+*.json.tmp
+
+# Lookup session caches and logs
+qrz_session.txt
+qrz.xml
+hamqth_session.json
+hamclock.log
+dx_points.txt
+
+# EiBi shortwave schedules (download your own from eibispace.de)
+sked-*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+
+# ADIF logs you import or export (personal QSO data)
+*.adi
+*.adif
+*.ADI
+*.ADIF

@@ -32,13 +32,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 try:
     import shapefile  # pyshp
-except Exception as e:  # pragma: no cover
+except Exception:  # pragma: no cover
     print("ERROR: Missing dependency 'pyshp' (import shapefile). Install: pip install pyshp", file=sys.stderr)
     raise
 
 try:
     from PIL import Image, ImageDraw
-except Exception as e:  # pragma: no cover
+except Exception:  # pragma: no cover
     print("ERROR: Missing dependency 'Pillow'. Install: pip install Pillow", file=sys.stderr)
     raise
 
@@ -329,7 +329,6 @@ def screen_show_interpreted(s: Screen, trailing_newline: bool) -> None:
                 _print_color(s, SEQ_RESET)
                 continue
 
-            sun_found = False
             is_sun_border = False
             is_track = False
 
@@ -342,7 +341,6 @@ def screen_show_interpreted(s: Screen, trailing_newline: bool) -> None:
 
             if s.sun.active:
                 if a == s.col_sun or b == s.col_sun or c == s.col_sun or d == s.col_sun:
-                    sun_found = True
                     _print_color(s, SEQ_SUN)
                     sys.stdout.write(char_sun)
                     _print_color(s, SEQ_RESET)

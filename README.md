@@ -2,18 +2,21 @@ This is a vibe coded ham clock.  Pretty much nothing in here was coded by me.  I
 
 You wil need a couple of python libraries, pillow, pyshp and ncurses for sure.  I think modern 3+ python comes with the rest already installed.  It will warn you if you are missing anything.
 
-There are a few settings you need to declare near the top of hamclock.py before it will work properly.
+Settings live in hamclock_settings.json next to hamclock.py.  That file is not in git because it holds your passwords.  On the first run with no settings file the Settings screen opens so you can fill it in, or you can copy hamclock_settings.example.json to hamclock_settings.json and edit it.  The main ones:
 
-wx_location_name: It will display this in the local weather panel if it can't figure out where you are from lat/long/grid square
-wx_lat/wx_long: These are in decimal notation and are optional.  It will convert your grid square if given.
-wx_grid: This is your grid square.  With out it, hamclock can't calculate your lat/long and get weather.
-wx_update_seconds: Defaulted to 1800 (30 minutes)
-map_image_path: Not used.  I should get rid of it.
-refresh_seconds: This needs a better name.  But it's for how often it refreshes the space weather.  Should be set much higher then default 10 seconds.
-map_refresh_seconds: How often to update the world map.
-time_refresh_seconds: Default is one second so it makes the clock tick
+grid_square: This is your grid square.  With out it (or latitude/longitude), hamclock can't work out where you are and get weather.
+latitude_decimal/longitude_decimal: Optional, in decimal notation.  It will convert your grid square if these are blank.
+wx_location_name: It will display this in the local weather panel if it can't figure out where you are.
+time_zone: IANA name like America/Edmonton.  The "Local" clock uses this; leave it blank to use the Pi's own time zone.
+space_weather_refresh_sec / local_weather_refresh_sec: How often to fetch space weather and local weather.  Default 1800 (30 minutes).
+world_map_refresh_sec: How often to update the world map.
+time_refresh_seconds: Default is one second so it makes the clock tick.
+dx_cluster_host/port/username/password, dx_filter: Your DX cluster login.  Set from Esc > DX Cluster.
+enable_logging: Debug log to hamclock.log.  Off by default because it gets huge.
 
-Pressing ESC will bring up a menu with "Settings" and "Quit".  Only Quit works at the moment.  I will have to vibe code in the settings at some point.  You can also just press "q" while it's running to quit.
+Press ? (or F1) for a help screen listing every key.  The hint is shown in the bottom border of the map panel.  Pressing ESC will bring up the menu (Settings, Rig Control, DX Cluster, Local Database, Shortwave, Online lookup, Look up call sign, Quit).  You can also just press "q" while it's running to quit.
+
+If HTTPS fetches fail with certificate errors, fix the Pi's certificates with "sudo apt install --reinstall ca-certificates".  As a last resort MYHAMCLOCK_INSECURE_SSL=1 turns off certificate checks.
 
 Have fun with it.
 
@@ -43,3 +46,26 @@ April 6/2025 changes
   "shortwave_highlight_color": "cyan",
   "shortwave_broadcast_bands_only": true
 - You will also need the two new .json files that convert languages and locations.
+
+November 24/2026 changes (bug fixes and cleanup)
+- HamQTH lookups work now.  Two helper functions they needed were missing.
+- Fixed a crash when opening the Station Callsigns menu.
+- Saving the main Settings no longer resets your shortwave languages to "E".
+- The time_zone setting is used for the Local clock.
+- Space weather, local weather, radio polling and DE/DX callsign lookups run in the background, so the clock keeps ticking if a website or rigctld is slow.  Closing a menu no longer re-downloads everything.
+- Local weather refreshes on its own timer instead of waiting for space weather.
+- Radio panel reads COMP, NB, NR, pre-amp and AGC from rigctld.  Shows "-" for anything your radio doesn't report.
+- DX cluster reconnects by itself after you save new DX Cluster settings, and says "not configured" when there's no host.
+- DX cluster login is now stored once (dx_cluster_*).  Old dx_host/dx_user/dx_pass/dx_port values are moved over automatically.
+- HTTPS no longer silently turns off certificate checks when verification fails.
+- Debug logging is off by default.
+- hamclock_settings.json is no longer tracked in git.  Use hamclock_settings.example.json as a starting point.
+- Removed duplicate and dead code.
+- "? or F1 = Help  Esc = Menu" hint on the map panel border.  ? opens help too, and F1 now works from PuTTY's default keyboard setting.
+- When rig control is off the Radio box is hidden and the DE / DX panel uses its space.  The DE / DX panel switches to a compact layout when it's short on room, so both DE and DX fit on a 24-line terminal.
+- Esc in the Rig Control dialog now cancels changes instead of keeping them.
+- Station Callsigns menu (C in Logbook mode) has Edit and Delete.  Editing a callsign also updates the QSOs logged under it.  Deleting one with QSOs hides it from the list and keeps the QSOs.
+- New callsigns must look like a callsign (letters, numbers and /).
+- Text boxes: Esc cancels instead of typing ^[, and the current value is filled in so you can edit it.  Pressing Enter on a setting no longer blanks it.
+- Re-selecting the default callsign no longer wipes its display name.
+- ADIF import/export.  In Logbook mode press I to import or X to export (also in the Esc menu).  Import reads .adi/.adif files, or a .zip with one inside (eQSL, LoTW, QRZ, WSJT-X etc.), from the hamclock folder, your home folder or ~/Downloads, or a path you type.  QSOs already in the log are skipped, so importing the same file twice is safe.  Fields the logbook has no column for (QSL status, contest info...) are kept and written back out on export.  Exports go to the hamclock folder unless you type another path.  adif.py needs to be in the same folder as hamclock.py.
