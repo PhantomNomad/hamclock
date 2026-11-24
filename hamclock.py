@@ -32,6 +32,24 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+def _load_sibling_module(name: str):
+    """Import name.py from this file's folder, however Python was started."""
+    import importlib.util as _ilu
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
+    if not os.path.exists(path):
+        return None
+    try:
+        spec = _ilu.spec_from_file_location(name, path)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        sys.modules.pop(name, None)
+        return None
+
+
+adif = _load_sibling_module("adif")  # ADIF reader/writer; None if adif.py is missing
 from datetime import datetime, timezone
 try:
     from zoneinfo import ZoneInfo
@@ -517,6 +535,11 @@ def ensure_logbook_schema(cfg: AppConfig) -> None:
                     updated_utc TEXT NOT NULL
                 )
             """)
+
+        # Added for ADIF import/export: ADIF fields with no column of their own
+        # (QSL status, contest info, ...) so an export gives them back.
+        if "adif_extra" not in _table_columns_generic(conn, "qso_log"):
+            cur.execute("ALTER TABLE qso_log ADD COLUMN adif_extra TEXT")
 
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_station_callsigns_callsign ON station_callsigns (callsign)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qso_log_station_callsign_id ON qso_log (station_callsign_id)")
@@ -1063,6 +1086,227 @@ def delete_qso_log(cfg: AppConfig, qso_id: int) -> None:
     finally:
         _db_close(conn)
 
+
+
+# ---- ADIF import / export ----
+# ADIF field -> qso_log column. Anything else in a record is kept in adif_extra.
+_ADIF_TEXT_FIELDS = {
+    "RST_SENT": "rst_sent",
+    "RST_RCVD": "rst_recv",
+    "NAME": "their_name",
+    "QTH": "their_qth",
+    "GRIDSQUARE": "their_grid",
+    "COUNTRY": "their_country",
+}
+_ADIF_HANDLED = set(_ADIF_TEXT_FIELDS) | {
+    "CALL", "QSO_DATE", "TIME_ON", "BAND", "FREQ", "MODE", "SUBMODE",
+    "STATE", "VE_PROV", "TX_PWR", "COMMENT", "NOTES",
+    "STATION_CALLSIGN", "OPERATOR", "OWNER_CALLSIGN",
+}
+
+
+def adif_record_to_qso(rec: dict) -> Tuple[Optional[dict], str]:
+    """Convert one ADIF record to (qso entry dict, adif_extra string).
+
+    Returns (None, reason) if the record can't be used.
+    """
+    # Keep the callsign exactly as logged (W1VET/QRP, VE3/W1AW ...);
+    # _normalize_callsign() would strip the prefix/suffix.
+    call = re.sub(r"\s+", "", rec.get("CALL", "")).upper()
+    if not call:
+        return None, "no CALL"
+    if not re.fullmatch(r"[A-Z0-9/]+", call):
+        return None, f"bad CALL {rec.get('CALL', '')!r}"
+    d = re.sub(r"\D", "", rec.get("QSO_DATE", ""))
+    if len(d) != 8:
+        return None, f"{call}: bad QSO_DATE {rec.get('QSO_DATE', '')!r}"
+    t = re.sub(r"\D", "", rec.get("TIME_ON", ""))
+    if len(t) not in (4, 6):
+        return None, f"{call}: bad TIME_ON {rec.get('TIME_ON', '')!r}"
+    t = (t + "00")[:6]
+    try:
+        datetime(int(d[:4]), int(d[4:6]), int(d[6:8]), int(t[:2]), int(t[2:4]), int(t[4:6]))
+    except ValueError:
+        return None, f"{call}: invalid date/time {d} {t}"
+
+    freq_khz = None
+    if rec.get("FREQ", "").strip():
+        try:
+            freq_khz = round(float(rec["FREQ"]) * 1000.0, 3)
+        except ValueError:
+            pass
+    band = rec.get("BAND", "").strip().lower() or (_freq_to_band_name(freq_khz) if freq_khz else "")
+    tx_pwr = None
+    if rec.get("TX_PWR", "").strip():
+        try:
+            tx_pwr = float(re.sub(r"[^0-9.]", "", rec["TX_PWR"]))
+        except ValueError:
+            pass
+    remarks = " | ".join(v.strip() for v in (rec.get("COMMENT", ""), rec.get("NOTES", "")) if v and v.strip())
+
+    entry = {
+        "worked_callsign": call,
+        "qso_date": f"{d[:4]}-{d[4:6]}-{d[6:8]}",
+        "qso_time": f"{t[:2]}:{t[2:4]}:{t[4:6]}",
+        "band": band,
+        "frequency_khz": freq_khz,
+        "mode": rec.get("MODE", "").strip().upper(),
+        "submode": rec.get("SUBMODE", "").strip().upper(),
+        "their_state_province": (rec.get("STATE", "") or rec.get("VE_PROV", "")).strip(),
+        "tx_power_w": tx_pwr,
+        "remarks": remarks,
+        "station_callsign": rec.get("STATION_CALLSIGN", "") or rec.get("OPERATOR", ""),
+    }
+    for field_name, col in _ADIF_TEXT_FIELDS.items():
+        entry[col] = rec.get(field_name, "").strip()
+    extra = {k: v for k, v in rec.items() if k not in _ADIF_HANDLED and not k.startswith("_")}
+    return entry, (adif.fields_to_string(extra) if adif and extra else "")
+
+
+def adif_guess_station_callsign(header: dict, records: List[dict]) -> str:
+    """Station callsign the file was logged under, if it says."""
+    for rec in records[:50]:
+        for key in ("STATION_CALLSIGN", "OPERATOR", "OWNER_CALLSIGN"):
+            call = valid_station_callsign(rec.get(key, ""))
+            if call:
+                return call
+    for key in ("STATION_CALLSIGN", "OPERATOR", "OWNER_CALLSIGN"):
+        call = valid_station_callsign(header.get(key, ""))
+        if call:
+            return call
+    m = re.search(r"\bFor\s+([A-Z0-9/]+)", header.get("_PREAMBLE", ""), re.IGNORECASE)  # eQSL style
+    return valid_station_callsign(m.group(1)) if m else ""
+
+
+def _qso_dupe_key(call: str, qso_date: str, qso_time: str, band: str, mode: str) -> tuple:
+    return (call.upper(), qso_date, str(qso_time or "")[:5], (band or "").lower(), (mode or "").upper())
+
+
+def import_adif_records(cfg: AppConfig, records: List[dict], default_station_id: int,
+                        default_station_call: str) -> dict:
+    """Insert ADIF records into qso_log. Skips QSOs already in the log
+    (same station, call, date, time to the minute, band and mode)."""
+    stats = {"imported": 0, "duplicates": 0, "skipped": 0, "errors": []}
+    station_ids = {default_station_call: default_station_id}
+    ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT station_callsign_id, worked_callsign, qso_date, qso_time, band, mode FROM qso_log")
+        existing = {
+            (int(r[0]),) + _qso_dupe_key(str(r[1] or ""), str(r[2] or ""), str(r[3] or ""), str(r[4] or ""), str(r[5] or ""))
+            for r in (cur.fetchall() or [])
+        }
+        now = utc_now_iso()
+        sql = f"""
+            INSERT INTO qso_log (
+                station_callsign_id, operator_callsign, qso_date, qso_time,
+                worked_callsign, band, frequency_khz, mode, submode,
+                rst_sent, rst_recv, their_name, their_qth, their_grid,
+                their_state_province, their_country, tx_power_w, remarks,
+                adif_extra, created_utc, updated_utc
+            ) VALUES ({", ".join([ph] * 21)})
+        """
+        for rec in records:
+            entry, extra = adif_record_to_qso(rec)
+            if entry is None:
+                stats["skipped"] += 1
+                if len(stats["errors"]) < 20:
+                    stats["errors"].append(extra)
+                continue
+            st_call = valid_station_callsign(entry.pop("station_callsign", "")) or default_station_call
+            if st_call not in station_ids:
+                # Record says it was logged by a different station callsign.
+                station_ids[st_call] = ensure_station_callsign(cfg, st_call) or default_station_id
+            sid = station_ids[st_call]
+            key = (sid,) + _qso_dupe_key(entry["worked_callsign"], entry["qso_date"], entry["qso_time"], entry["band"], entry["mode"])
+            if key in existing:
+                stats["duplicates"] += 1
+                continue
+            existing.add(key)
+            cur.execute(sql, (
+                sid, st_call, entry["qso_date"], entry["qso_time"], entry["worked_callsign"],
+                entry["band"], entry["frequency_khz"], entry["mode"], entry["submode"],
+                entry["rst_sent"], entry["rst_recv"], entry["their_name"], entry["their_qth"],
+                entry["their_grid"].upper(), entry["their_state_province"], entry["their_country"],
+                entry["tx_power_w"], entry["remarks"], extra, now, now,
+            ))
+            stats["imported"] += 1
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        _db_close(conn)
+    return stats
+
+
+def export_adif(cfg: AppConfig, path: str, station_id: Optional[int] = None) -> int:
+    """Write QSOs (all, or one station callsign's) to an ADI file. Returns count."""
+    if adif is None:
+        raise RuntimeError("adif.py is missing from the hamclock folder")
+    ph = _db_param() if _db_is_mysql_cfg(cfg) else "?"
+    conn = _db_connect_cfg(cfg)
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT q.worked_callsign, q.qso_date, q.qso_time, q.band, q.frequency_khz, q.mode, q.submode,
+                   q.rst_sent, q.rst_recv, q.their_name, q.their_qth, q.their_grid,
+                   q.their_state_province, q.their_country, q.tx_power_w, q.remarks, q.adif_extra,
+                   COALESCE(s.callsign, q.operator_callsign)
+            FROM qso_log q LEFT JOIN station_callsigns s ON s.id = q.station_callsign_id
+        """
+        params: tuple = ()
+        if station_id:
+            sql += f" WHERE q.station_callsign_id = {ph}"
+            params = (station_id,)
+        sql += " ORDER BY q.qso_date, q.qso_time, q.id"
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+    finally:
+        _db_close(conn)
+
+    def _num(v):
+        if v is None or v == "":
+            return ""
+        return f"{float(v):.6f}".rstrip("0").rstrip(".")
+
+    out = []
+    for r in rows:
+        (call, qdate, qtime, band, fkhz, mode, submode, rst_s, rst_r, name, qth, grid,
+         state_prov, country, pwr, remarks, extra, station) = r
+        rec = {
+            "CALL": call or "",
+            "QSO_DATE": str(qdate or "").replace("-", ""),
+            "TIME_ON": re.sub(r"\D", "", str(qtime or ""))[:6],
+            "BAND": band or "",
+            "FREQ": _num(float(fkhz) / 1000.0) if fkhz not in (None, "") else "",
+            "MODE": mode or "",
+            "SUBMODE": submode or "",
+            "RST_SENT": rst_s or "",
+            "RST_RCVD": rst_r or "",
+            "NAME": name or "",
+            "QTH": qth or "",
+            "GRIDSQUARE": grid or "",
+            "STATE": state_prov or "",
+            "COUNTRY": country or "",
+            "TX_PWR": _num(pwr),
+            "COMMENT": remarks or "",
+            "STATION_CALLSIGN": station or "",
+        }
+        for k, v in adif.string_to_fields(extra or "").items():
+            rec.setdefault(k, v)
+        out.append(rec)
+
+    text = adif.write_adif(out, program_id="hamclock")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return len(out)
 
 def set_default_station_callsign(cfg: AppConfig, station_id: int) -> None:
     conn = _db_connect_cfg(cfg)
@@ -1864,6 +2108,151 @@ def callsign_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
                 continue
 
 
+
+def _adif_candidate_files() -> List[str]:
+    """ADIF files (or zips holding one) in the hamclock folder, ~ and ~/Downloads."""
+    dirs = [_app_base_dir(), os.path.expanduser("~"), os.path.expanduser("~/Downloads")]
+    seen, found = set(), []
+    for d in dirs:
+        for pattern in ("*.adi", "*.adif", "*.ADI", "*.ADIF", "*.zip"):
+            for path in glob.glob(os.path.join(d, pattern)):
+                real = os.path.realpath(path)
+                if real in seen or not os.path.isfile(real):
+                    continue
+                seen.add(real)
+                if path.lower().endswith(".zip"):
+                    try:
+                        import zipfile
+                        with zipfile.ZipFile(path) as z:
+                            if not any(n.lower().endswith((".adi", ".adif")) for n in z.namelist()):
+                                continue
+                    except Exception:
+                        continue
+                found.append(path)
+    found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return found[:15]
+
+
+def _short_path(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def adif_import_dialog(stdscr, cfg: AppConfig, state: AppState) -> None:
+    if adif is None:
+        _simple_message_popup(stdscr, "ADIF Import", "adif.py is missing from the hamclock folder.")
+        return
+    ensure_logbook_schema(cfg)
+
+    files = _adif_candidate_files()
+    items = [_short_path(f) for f in files] + ["Type a path...", "Cancel"]
+    idx = _popup_menu(stdscr, "Import which ADIF file?", items)
+    if idx < 0 or items[idx] == "Cancel":
+        return
+    if idx < len(files):
+        path = files[idx]
+    else:
+        y0, x0, w = _station_input_pos(stdscr)
+        typed = _input_box(stdscr, y0, x0, w, "File: ", "~/")
+        if not typed or not typed.strip():
+            return
+        path = os.path.expanduser(typed.strip())
+        if not os.path.isabs(path):
+            path = os.path.join(_app_base_dir(), path)
+
+    try:
+        header, records, read_name = adif.read_adif_file(path)
+    except Exception as e:
+        _simple_message_popup(stdscr, "ADIF Import", f"Couldn't read {_short_path(path)}:\n{e}")
+        return
+    if not records:
+        _simple_message_popup(stdscr, "ADIF Import", f"No QSOs found in {os.path.basename(read_name)}.")
+        return
+
+    # Which station callsign do these QSOs belong to?
+    calls = get_station_callsigns(cfg)
+    guess = adif_guess_station_callsign(header, records)
+    choices: List[Tuple[str, Optional[dict]]] = []
+    if guess and not any(c["callsign"] == guess for c in calls):
+        choices.append((f"Log under {guess} (add it)", {"id": None, "callsign": guess}))
+    ordered = sorted(calls, key=lambda c: (c["callsign"] != guess, c["id"] != state.selected_station_callsign_id))
+    for c in ordered:
+        choices.append((f"Log under {c['callsign']}", c))
+    choices.append(("Add a different callsign...", {"id": None, "callsign": ""}))
+    labels = [c[0] for c in choices] + ["Cancel"]
+    pick = _popup_menu(stdscr, f"{len(records)} QSOs - station callsign?", labels)
+    if pick < 0 or pick >= len(choices):
+        return
+    station = dict(choices[pick][1])
+    if not station["callsign"]:
+        call = _ask_station_callsign(stdscr, "Station Callsign: ")
+        if call is None:
+            return
+        station["callsign"] = call
+    if not station["id"]:
+        station["id"] = ensure_station_callsign(cfg, station["callsign"])
+
+    if not _confirm_dialog(stdscr, "ADIF Import",
+                           f"Import {len(records)} QSOs from\n{os.path.basename(read_name)}\n"
+                           f"under {station['callsign']}?\nQSOs already in the log are skipped."):
+        return
+    state.status_line = f"Importing {len(records)} QSOs..."
+    state.dirty_status = True
+    try:
+        stats = import_adif_records(cfg, records, station["id"], station["callsign"])
+    except Exception as e:
+        _simple_message_popup(stdscr, "ADIF Import", f"Import failed, nothing was saved:\n{e}")
+        return
+
+    if not state.selected_station_callsign_id:
+        state.selected_station_callsign_id = station["id"]
+        state.selected_station_callsign = station["callsign"]
+    _refresh_logbook_view(cfg, state)
+    msg = [f"Imported:   {stats['imported']}",
+           f"Already in log (skipped): {stats['duplicates']}"]
+    if stats["skipped"]:
+        msg.append(f"Unreadable (skipped): {stats['skipped']}")
+        msg.extend("  " + e for e in stats["errors"][:5])
+    state.status_line = f"ADIF import: {stats['imported']} added, {stats['duplicates']} duplicates, {stats['skipped']} skipped"
+    state.dirty_status = True
+    _simple_message_popup(stdscr, "ADIF Import", "\n".join(msg))
+
+
+def adif_export_dialog(stdscr, cfg: AppConfig, state: AppState) -> None:
+    if adif is None:
+        _simple_message_popup(stdscr, "ADIF Export", "adif.py is missing from the hamclock folder.")
+        return
+    ensure_logbook_schema(cfg)
+    calls = get_station_callsigns(cfg)
+    station = None
+    if len(calls) > 1:
+        labels = ["All QSOs"] + [f"Only {c['callsign']}" for c in calls] + ["Cancel"]
+        idx = _popup_menu(stdscr, "Export which QSOs?", labels)
+        if idx < 0 or idx == len(labels) - 1:
+            return
+        station = calls[idx - 1] if idx > 0 else None
+    name_call = (station or (calls[0] if len(calls) == 1 else None) or {}).get("callsign", "hamclock")
+    default = f"{name_call.replace('/', '-')}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.adi"
+    y0, x0, w = _station_input_pos(stdscr)
+    typed = _input_box(stdscr, y0, x0, w, "Save as: ", default)
+    if not typed or not typed.strip():
+        return
+    path = os.path.expanduser(typed.strip())
+    if not os.path.isabs(path):
+        path = os.path.join(_app_base_dir(), path)
+    if not path.lower().endswith((".adi", ".adif")):
+        path += ".adi"
+    if os.path.exists(path) and not _confirm_dialog(stdscr, "ADIF Export", f"{_short_path(path)} exists.\nOverwrite it?"):
+        return
+    try:
+        n = export_adif(cfg, path, station["id"] if station else None)
+    except Exception as e:
+        _simple_message_popup(stdscr, "ADIF Export", f"Export failed:\n{e}")
+        return
+    state.status_line = f"Exported {n} QSOs to {_short_path(path)}"
+    state.dirty_status = True
+    _simple_message_popup(stdscr, "ADIF Export", f"Exported {n} QSOs to\n{_short_path(path)}")
+
 def delete_selected_qso_dialog(stdscr, cfg: AppConfig, state: AppState) -> bool:
     rows = list(getattr(state, "logbook_recent_rows", []) or [])
     idx = int(getattr(state, "logbook_selected_idx", 0) or 0)
@@ -2326,7 +2715,8 @@ def edit_shortwave_dialog(stdscr, cfg: AppConfig, state: AppState):
 
 
 def file_menu_dialog(stdscr, cfg: AppConfig, state: AppState):
-    items = ["Settings", "Rig Control", "DX Cluster", "Local Database", "Shortwave", "Online lookup", "Look up call sign", "Quit"]
+    items = ["Settings", "Rig Control", "DX Cluster", "Local Database", "Shortwave", "Online lookup", "Look up call sign",
+             "Import ADIF log", "Export ADIF log", "Quit"]
     idx = 0
     curses.curs_set(0)
     stdscr.nodelay(False)
@@ -2393,6 +2783,14 @@ def file_menu_dialog(stdscr, cfg: AppConfig, state: AppState):
                 edit_online_lookup_dialog(stdscr, cfg, state)
             elif choice == "Look up call sign":
                 callsign_lookup_dialog(stdscr, cfg, state)
+            elif choice in ("Import ADIF log", "Export ADIF log"):
+                try:
+                    if choice.startswith("Import"):
+                        adif_import_dialog(stdscr, cfg, state)
+                    else:
+                        adif_export_dialog(stdscr, cfg, state)
+                except Exception as e:
+                    _simple_message_popup(stdscr, "ADIF", str(e))
             elif choice == "Quit":
                 state.running = False
                 curses.curs_set(0)
@@ -6550,6 +6948,8 @@ def show_help_screen(stdscr, state: AppState):
         "  C = Manage/select station callsigns",
         "  E = Edit selected QSO",
         "  D = Delete selected QSO",
+        "  I = Import ADIF log (.adi, or a .zip with one in it)",
+        "  X = Export ADIF log",
         "  Up/Down = Select recent QSO",
         "",
         "Station callsigns (C in Logbook mode)",
@@ -7508,6 +7908,16 @@ def main(stdscr):
                         _simple_message_popup(stdscr, "Callsign", str(e))
                         state.status_line = f"Callsign error: {e}"
                         state.dirty_status = True
+            elif k in (ord('I'), ord('i'), ord('X'), ord('x')):
+                if state.logging_mode:
+                    try:
+                        if k in (ord('I'), ord('i')):
+                            adif_import_dialog(stdscr, cfg, state)
+                        else:
+                            adif_export_dialog(stdscr, cfg, state)
+                    except Exception as e:
+                        _simple_message_popup(stdscr, "ADIF", str(e))
+                    force_full_redraw(stdscr, state)
             elif k in (ord('E'), ord('e')):
                 if state.logging_mode and state.logbook_recent_rows:
                     idx = max(0, min(len(state.logbook_recent_rows) - 1, int(getattr(state, 'logbook_selected_idx', 0) or 0)))

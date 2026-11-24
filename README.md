@@ -68,3 +68,4 @@ November 24/2026 changes (bug fixes and cleanup)
 - New callsigns must look like a callsign (letters, numbers and /).
 - Text boxes: Esc cancels instead of typing ^[, and the current value is filled in so you can edit it.  Pressing Enter on a setting no longer blanks it.
 - Re-selecting the default callsign no longer wipes its display name.
+- ADIF import/export.  In Logbook mode press I to import or X to export (also in the Esc menu).  Import reads .adi/.adif files, or a .zip with one inside (eQSL, LoTW, QRZ, WSJT-X etc.), from the hamclock folder, your home folder or ~/Downloads, or a path you type.  QSOs already in the log are skipped, so importing the same file twice is safe.  Fields the logbook has no column for (QSL status, contest info...) are kept and written back out on export.  Exports go to the hamclock folder unless you type another path.  adif.py needs to be in the same folder as hamclock.py.
