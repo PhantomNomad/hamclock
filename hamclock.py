@@ -3535,7 +3535,7 @@ def resolve_wx_latlon(cfg: AppConfig):
         return float(lat), float(lon)
     return None, None
 
-def fetch_open_meteo_current(lat: float, lon: float, timeout: float = 10.0):
+def fetch_open_meteo_current(lat: float, lon: float, timeout: float = 20.0, attempts: int = 3):
     """Fetch current conditions from Open-Meteo for a given lat/lon."""
     params = {
         "latitude": f"{lat:.5f}",
@@ -3554,10 +3554,16 @@ def fetch_open_meteo_current(lat: float, lon: float, timeout: float = 10.0):
         "timezone": "UTC",
     }
     url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "MyHamClock/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    return data
+    last_exc: Optional[Exception] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return json.loads(_fetch_url(url, timeout=timeout))
+        except Exception as e:  # timeouts, resets, transient HTTP errors
+            last_exc = e
+            _log_exception(f"fetch_open_meteo_current attempt {attempt + 1}/{attempts}", e)
+            if attempt + 1 < attempts:
+                time.sleep(2 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
 
 
 def wmo_weather_code_to_text(code: Optional[int]) -> str:
@@ -3641,13 +3647,27 @@ def update_weather_open_meteo(cfg: AppConfig, state: AppState):
             f"Wind:  {ws:.0f} km/h @ {wd:.0f}° ({wind_deg_to_compass(wd)})  Gust {gust:.0f}" if ws is not None and wd is not None and gust is not None else "Wind:  N/A",
             f"Sky:   {sky}",
         ]
+        state.wx_last_good_lines = list(state.wx_static_lines)
+        state.wx_last_good_time = time.time()
     except Exception as e:
-        state.wx_static_lines = [
-            (cfg.wx_location_name or "Weather"),
-            "Temp:  N/A",
-            "Wind:  N/A",
-            f"Sky:   error: {e}",
-        ]
+        _log_exception("update_weather_open_meteo", e)
+        msg = str(e) or e.__class__.__name__
+        if "timed out" in msg.lower():
+            msg = "timed out"
+        good = getattr(state, "wx_last_good_lines", None)
+        if good:
+            # Keep showing the last good reading instead of blanking the panel.
+            age_min = int((time.time() - getattr(state, "wx_last_good_time", time.time())) / 60)
+            state.wx_static_lines = list(good[:-1]) + [f"{good[-1]}  (stale {age_min}m: {msg})"]
+        else:
+            state.wx_static_lines = [
+                (cfg.wx_location_name or "Weather"),
+                "Temp:  N/A",
+                "Wind:  N/A",
+                f"Sky:   error: {msg}",
+            ]
+        # Retry sooner than the normal refresh interval.
+        state.wx_retry_at = time.time() + 120
 
     state.dirty_wx_static = True
 
@@ -3709,7 +3729,9 @@ def data_refresh_worker(cfg: AppConfig, state: AppState) -> None:
                 _log_exception("data_refresh_worker space weather", e)
             last_space = time.time()
 
-        if forced or (now - last_wx) >= wx_every:
+        retry_at = getattr(state, "wx_retry_at", 0.0) or 0.0
+        if forced or (now - last_wx) >= wx_every or (retry_at and now >= retry_at):
+            state.wx_retry_at = 0.0
             try:
                 update_weather_open_meteo(cfg, state)
             except Exception as e:
